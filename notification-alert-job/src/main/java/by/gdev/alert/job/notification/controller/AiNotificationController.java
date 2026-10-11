@@ -8,6 +8,7 @@ import by.gdev.alert.job.notification.service.ai.queue.AiDecisionDedupRegistry;
 import by.gdev.alert.job.notification.service.ai.queue.UserQueueManager;
 import by.gdev.common.model.HeaderName;
 import by.gdev.common.model.SiteName;
+import by.gdev.common.util.ReplyTextNormalizer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -33,6 +34,7 @@ public class AiNotificationController {
 
     @PostMapping("/decision")
     public Mono<ResponseEntity<?>> receiveAiDecision(@RequestBody AiNotificationPayload payload) {
+        normalizeDecisionReply(payload);
         String key = payload.getOrder() != null ? payload.getOrder().getLink() : null;
         if (!dedupRegistry.tryAcquire(key)) {
             log.warn("DUPLICATE DROPPED at NotificationController: {}", key);
@@ -110,5 +112,19 @@ public class AiNotificationController {
                         request.getUserEmail()
                 ))
                 .subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private static void normalizeDecisionReply(AiNotificationPayload payload) {
+        if (payload == null || payload.getDecision() == null) {
+            return;
+        }
+        String reply = payload.getDecision().reply();
+        if (reply == null) {
+            return;
+        }
+        String normalized = ReplyTextNormalizer.normalize(reply);
+        if (!normalized.equals(reply)) {
+            payload.setDecision(new AiDecision(normalized));
+        }
     }
 }
