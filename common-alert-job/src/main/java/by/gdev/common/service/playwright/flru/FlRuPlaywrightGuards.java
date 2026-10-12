@@ -13,6 +13,9 @@ public final class FlRuPlaywrightGuards {
     /** Подстрока в тексте ошибки для retry — без hardcode имени сайта в проверке. */
     public static final String DDOS_RETRY_FAIL_MARKER = "не удалось открыть страницу логина";
 
+    /** Заголовок страницы FL.ru «сайт на техобслуживании». */
+    public static final String SITE_MAINTENANCE_MARKER = "На сайте проводятся технические работы";
+
     private static final String SUSPICIOUS_IP_ACTIVITY_MARKER = "подозрительная активность";
 
     private FlRuPlaywrightGuards() {
@@ -27,6 +30,32 @@ public final class FlRuPlaywrightGuards {
             return false;
         }
         return containsSuspiciousIpActivityText(htmlOrText.toLowerCase(Locale.ROOT));
+    }
+
+    public static boolean isSiteMaintenancePage(Page page) {
+        if (page == null) {
+            return false;
+        }
+        try {
+            Locator heading = page.locator("h1").first();
+            if (heading.count() > 0 && heading.isVisible()) {
+                String h1 = heading.innerText();
+                if (h1 != null && h1.contains(SITE_MAINTENANCE_MARKER)) {
+                    return true;
+                }
+            }
+            Locator layout = page.locator("table.body-wrap").first();
+            if (layout.count() > 0) {
+                String wrapText = layout.innerText();
+                if (wrapText != null && wrapText.contains(SITE_MAINTENANCE_MARKER)) {
+                    return true;
+                }
+            }
+            String bodyText = page.locator("body").innerText();
+            return bodyText != null && bodyText.contains(SITE_MAINTENANCE_MARKER);
+        } catch (RuntimeException ignored) {
+            return false;
+        }
     }
 
     public static boolean isSuspiciousIpActivityBlock(Page page) {

@@ -94,6 +94,22 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
             "На FL.ru закончились доступные отклики (или не хватает средств на балансе). "
                     + "Пополните баланс или купите отклики на сайте, чтобы сервис мог отправлять автоответы.";
 
+    private static final String EXECUTOR_SELECTED_MARKER = "Заказчик выбрал исполнителя";
+
+    private static final String[] EXECUTOR_SELECTED_SELECTORS = {
+            "text=Заказчик выбрал исполнителя",
+            "text=Заказчик выбрал исполнителя:",
+            ":text-is('Заказчик выбрал исполнителя:')"
+    };
+
+    private static final String EXECUTOR_SELECTED_USER_MESSAGE =
+            "На FL.ru заказчик уже выбрал исполнителя по этому проекту — новые отклики не принимаются. "
+                    + "Автоответ не отправлен.";
+
+    private static final String SITE_MAINTENANCE_USER_MESSAGE =
+            "На FL.ru проводятся технические работы — сайт временно недоступен. "
+                    + "Попробуйте отправить автоответ позже.";
+
     /** Сколько раз подряд можно обрабатывать validate/email в одном входе (они могут чередоваться). */
     private static final int LOGIN_STAGE_MAX_ITERATIONS = 12;
 
@@ -161,6 +177,10 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
     @Override
     void safeNavigate(Page page, String url) {
         super.safeNavigate(page, url);
+        StepResult<Void> maintenance = failIfSiteMaintenance(page, "navigate");
+        if (maintenance != null) {
+            throw new FlRuStepFailureException(maintenance);
+        }
         StepResult<Void> gate = ensurePastValidateCaptcha(page, "navigate");
         if (gate != null) {
             throw new FlRuStepFailureException(gate);
@@ -635,6 +655,10 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
      * @return {@code null} если страницы нет или успешно прошли; иначе ошибка шага
      */
     private StepResult<Void> ensurePastValidateCaptcha(Page page, String login) {
+        StepResult<Void> maintenance = failIfSiteMaintenance(page, login);
+        if (maintenance != null) {
+            return maintenance;
+        }
         if (!validateCaptchaSupport.isValidateCaptchaPage(page)) {
             return null;
         }
@@ -1144,11 +1168,21 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
 
     /**
      * Открывает форму отклика (кнопка «Откликнуться») и ждёт поле текста.
+     * Если на сайте техработы — ошибка {@link AutoreplyErrorTypes#SITE_MAINTENANCE}.
+     * Если заказчик уже выбрал исполнителя — ошибка {@link AutoreplyErrorTypes#ORDER_EXECUTOR_SELECTED}.
      * Если FL.ru показывает попап покупки отклика — сразу ошибка {@link AutoreplyErrorTypes#TARIFF_LIMIT}.
      *
      * @return {@code null}, если форма готова; иначе ошибка шага
      */
     private StepResult<Void> prepareFlRuReplyForm(Page page, String login) {
+        StepResult<Void> maintenance = failIfSiteMaintenance(page, login);
+        if (maintenance != null) {
+            return maintenance;
+        }
+        StepResult<Void> closed = failIfExecutorAlreadySelected(page, login);
+        if (closed != null) {
+            return closed;
+        }
         if (isReplyFormPresent(page)) {
             return null;
         }
@@ -1175,6 +1209,14 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
         int attempts = 0;
         while (System.currentTimeMillis() < deadline) {
             attempts++;
+            maintenance = failIfSiteMaintenance(page, login);
+            if (maintenance != null) {
+                return maintenance;
+            }
+            closed = failIfExecutorAlreadySelected(page, login);
+            if (closed != null) {
+                return closed;
+            }
             paywall = failIfBuyResponsePaywall(page, login);
             if (paywall != null) {
                 return paywall;
@@ -1198,6 +1240,14 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
             page.waitForTimeout(Math.min(pollMs, remaining));
         }
 
+        maintenance = failIfSiteMaintenance(page, login);
+        if (maintenance != null) {
+            return maintenance;
+        }
+        closed = failIfExecutorAlreadySelected(page, login);
+        if (closed != null) {
+            return closed;
+        }
         paywall = failIfBuyResponsePaywall(page, login);
         if (paywall != null) {
             return paywall;
@@ -1209,6 +1259,54 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
                 "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНО ПОЛЕ ТЕКСТА ОТКЛИКА, пользователь: " + login,
                 AutoreplyErrorTypes.FIELD_NOT_FOUND);
         return StepResult.fail(StepType.SEND_AUTOREPLY, "Поле текста отклика не найдено", captureScreenshot(page));
+    }
+
+    private StepResult<Void> failIfSiteMaintenance(Page page, String login) {
+        if (!FlRuPlaywrightGuards.isSiteMaintenancePage(page)) {
+            return null;
+        }
+        log.warn("АВТООТВЕТ: {} -> технические работы на сайте, url={}, пользователь: {}",
+                getSiteName(), page.url(), login);
+        report(Level.WARN, log,
+                "АВТООТВЕТ: " + getSiteName() + " -> ТЕХНИЧЕСКИЕ РАБОТЫ НА САЙТЕ, пользователь: " + login,
+                AutoreplyErrorTypes.SITE_MAINTENANCE);
+        return StepResult.fail(StepType.SEND_AUTOREPLY, AutoreplyErrorTypes.SITE_MAINTENANCE,
+                SITE_MAINTENANCE_USER_MESSAGE, captureScreenshot(page));
+    }
+
+    private StepResult<Void> failIfExecutorAlreadySelected(Page page, String login) {
+        if (!isFlRuExecutorSelectedBadgeVisible(page)) {
+            return null;
+        }
+        log.warn("АВТООТВЕТ: {} -> заказчик выбрал исполнителя (отклики закрыты), url={}, пользователь: {}",
+                getSiteName(), page.url(), login);
+        report(Level.WARN, log,
+                "АВТООТВЕТ: " + getSiteName() + " -> ЗАКАЗЧИК ВЫБРАЛ ИСПОЛНИТЕЛЯ, пользователь: " + login,
+                AutoreplyErrorTypes.ORDER_EXECUTOR_SELECTED);
+        return StepResult.fail(StepType.SEND_AUTOREPLY, AutoreplyErrorTypes.ORDER_EXECUTOR_SELECTED,
+                EXECUTOR_SELECTED_USER_MESSAGE, captureScreenshot(page));
+    }
+
+    private boolean isFlRuExecutorSelectedBadgeVisible(Page page) {
+        if (page == null) {
+            return false;
+        }
+        try {
+            for (String selector : EXECUTOR_SELECTED_SELECTORS) {
+                Locator badge = page.locator(selector).first();
+                if (badge.count() > 0 && badge.isVisible()) {
+                    return true;
+                }
+            }
+            String bodyText = page.locator("body").innerText();
+            if (bodyText != null && bodyText.contains(EXECUTOR_SELECTED_MARKER)) {
+                Locator marker = page.locator("text=" + EXECUTOR_SELECTED_MARKER).first();
+                return marker.count() > 0;
+            }
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> проверка плашки «исполнитель выбран»: {}", getSiteName(), e.getMessage());
+        }
+        return false;
     }
 
     private StepResult<Void> failIfBuyResponsePaywall(Page page, String login) {
@@ -1319,12 +1417,24 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
             page.waitForLoadState(LoadState.NETWORKIDLE);
             log.info("АВТООТВЕТ: {} -> страница заказа открыта, пользователь: {}", getSiteName(), login);
             takeScreenshot(page, getSiteName(), payload.getUser().getUuid(), "order_page");
+        } catch (FlRuStepFailureException stepFailure) {
+            return stepFailure.getStepResult();
         } catch (Exception e) {
             report(Level.WARN, log,
                     "АВТООТВЕТ: " + getSiteName() + " -> НЕ УДАЛОСЬ ОТКРЫТЬ ЗАКАЗ, пользователь: "
                             + login + ", ошибка: " + e.getMessage(),
                     AutoreplyErrorTypes.ERROR_OPEN_PAGE);
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось открыть заказ: " + e.getMessage(), captureScreenshot(page));
+        }
+
+        StepResult<Void> maintenance = failIfSiteMaintenance(page, login);
+        if (maintenance != null) {
+            return maintenance;
+        }
+
+        StepResult<Void> orderClosed = failIfExecutorAlreadySelected(page, login);
+        if (orderClosed != null) {
+            return orderClosed;
         }
 
         StepResult<Void> replyFormReady = prepareFlRuReplyForm(page, login);

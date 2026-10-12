@@ -57,6 +57,8 @@ public final class AutoreplyFailurePolicy {
                  AutoreplyErrorTypes.BUTTON_NOT_FOUND,
                  AutoreplyErrorTypes.EMAIL_INVALID,
                  AutoreplyErrorTypes.TARIFF_LIMIT,
+                 AutoreplyErrorTypes.ORDER_EXECUTOR_SELECTED,
+                 AutoreplyErrorTypes.SITE_MAINTENANCE,
                  AutoreplyErrorTypes.EMAIL_CODE_LOGIN_ENABLED -> AutoreplyFailureAction.ABORT;
             default -> AutoreplyFailureAction.ABORT;
         };
