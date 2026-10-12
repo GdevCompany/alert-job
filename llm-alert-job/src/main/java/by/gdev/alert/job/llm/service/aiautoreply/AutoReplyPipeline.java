@@ -8,6 +8,7 @@ import by.gdev.alert.job.llm.service.aiautoreply.sender.DummyReplySender;
 import by.gdev.alert.job.llm.service.aiautoreply.sender.NotificationReplySender;
 import by.gdev.alert.job.llm.service.aiautoreply.sender.ReplySender;
 import by.gdev.alert.job.llm.service.template.LlmUserService;
+import by.gdev.common.util.ReplyTextNormalizer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -148,6 +149,6 @@ public class AutoReplyPipeline {
      */
     private String finalizeReply(AiDecision decision) {
         if (decision.getReply() == null) return null;
-        return decision.getReply().trim();
+        return ReplyTextNormalizer.normalize(decision.getReply().trim());
     }
 }

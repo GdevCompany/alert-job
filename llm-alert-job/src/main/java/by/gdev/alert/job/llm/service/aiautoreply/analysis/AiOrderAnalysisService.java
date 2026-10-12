@@ -7,6 +7,7 @@ import by.gdev.alert.job.llm.domain.dto.order.OrderDTO;
 import by.gdev.alert.job.llm.domain.dto.promt.AiPromptDto;
 import by.gdev.alert.job.llm.service.aiautoreply.promt.AiPromptService;
 import by.gdev.alert.job.llm.service.template.AiReplyTemplateService;
+import by.gdev.common.util.ReplyTextNormalizer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -14,7 +15,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 
@@ -214,7 +214,9 @@ public class AiOrderAnalysisService {
                         .replace("```", "")
                         .trim();
                 String json = extractJson(raw);
-                AiDecision decision =  mapper.readValue(json, AiDecision.class);
+                AiDecision decision = mapper.readValue(json, AiDecision.class);
+                decision.setReply(ReplyTextNormalizer.normalize(decision.getReply()));
+                decision.setPrefix(ReplyTextNormalizer.normalize(decision.getPrefix()));
                 decision.setValid(true);
                 log.info("""
 [LLM] AiDecision:
@@ -254,7 +256,7 @@ public class AiOrderAnalysisService {
             // ВСТАВЛЯЕМ СГЕНЕРИРОВАННЫЙ ТЕКСТ ПОСЛЕ ПРИВЕТСТВИЯ
             if (decision.getReply() != null && !decision.getReply().isEmpty()) {
                 String finalReply = buildFinalReply(replyTemplate, decision.getReply(), decision.getPrefix());
-                decision.setReply(finalReply);
+                decision.setReply(ReplyTextNormalizer.normalize(finalReply));
             }
             return decision;
         } catch (Exception e) {
