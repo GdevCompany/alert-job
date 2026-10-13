@@ -7,15 +7,18 @@ import by.gdev.alert.job.notification.service.ai.metrics.errors.AutoreplyErrorTy
 import by.gdev.alert.job.notification.service.ai.parser.AutoreplyPlaywrightParser;
 import by.gdev.alert.job.notification.service.ai.otp.OtpService;
 import by.gdev.alert.job.notification.service.ai.parser.YoudoTariffChecker;
+import by.gdev.alert.job.notification.service.ai.parser.youdo.YouDoLoginCaptcha;
+import by.gdev.alert.job.notification.service.ai.parser.youdo.YouDoSmartCaptchaSupport;
 import by.gdev.alert.job.notification.service.ai.proxy.AssignedProxyService;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
 import by.gdev.common.model.SiteName;
+import by.gdev.common.service.playwright.captcha.failure.CaptchaFailureInfo;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.options.AriaRole;
 import com.microsoft.playwright.options.LoadState;
-import com.microsoft.playwright.options.WaitForSelectorState;;
+import com.microsoft.playwright.options.WaitForSelectorState;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -28,16 +31,21 @@ import org.slf4j.event.Level;
 public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPlaywrightParser {
 
     private static final String[] LOGIN_BUTTON_SELECTORS = {
-            "data-test=LoginButton",
+            "header [data-test='LoginButton']",
             "[data-test='LoginButton']",
-            "text=Войти"
+            "data-test=LoginButton"
     };
 
     private static final String[] LOGIN_EMAIL_BUTTON_SELECTORS = {
             "data-test=LoginWithEmailButton",
             "[data-test='LoginWithEmailButton']",
-            "text=Войти через электронную почту"
+            "button[data-test='LoginWithEmailButton']",
+            "text=Войти через электронную почту",
+            "text=Войти через email"
     };
+
+    private static final int LOGIN_MODAL_WAIT_MS = 12_000;
+    private static final int LOGIN_CLICK_RETRY_MS = 28_000;
 
     private static final String[] EMAIL_ERROR_SELECTORS = {
             "text=Неправильный адрес электронной почты",
@@ -47,9 +55,35 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
 
     private static final String EMAIL_ERROR_MESSAGE = "Неправильный адрес электронной почты";
 
+    private static final int YOUDO_LOGIN_STAGE_MAX_ITERATIONS = 12;
+
+    private static final String YOUDO_STAGE_LOOP_EXHAUSTED_MESSAGE =
+            "YouDo: слишком много переходов между капчей, email и кодом из письма. Попробуйте ещё раз.";
+
+    private static final String YOUDO_EMAIL_SUBMIT_STUCK_CODE = "YOUDO_EMAIL_SUBMIT_STUCK";
+    private static final String YOUDO_EMAIL_SUBMIT_STUCK_MESSAGE =
+            "YouDo: отправка email зависла после капчи (спиннер на «Далее»). Попробуем другой прокси.";
+
+    private static final int YOUDO_POST_CAPTCHA_NEXT_MAX = 1;
+    private static final int YOUDO_POST_SUBMIT_WAIT_MS = 55_000;
+
+    /** Этапы входа YouDo: SmartCaptcha (чекбокс / калейдоскоп) и OTP могут чередоваться. */
+    private enum YouDoLoginStage {
+        SMART_CAPTCHA,
+        OTP_CODE,
+        EMAIL_FORM,
+        EMAIL_ERROR,
+        LOGGED_IN,
+        UNKNOWN
+    }
+
     private final OtpService otpService;
 
     private final YoudoTariffChecker youdoTariffChecker;
+
+    private final YouDoLoginCaptcha youDoLoginCaptcha;
+
+    private final YouDoSmartCaptchaSupport smartCaptchaSupport;
 
     @Value("${parser.autoreply.headless.youdo.com:true}")
     private void setHeadless(boolean headless) {
@@ -71,10 +105,14 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
 
     public YouDoAutoreplyParser(AssignedProxyService assignedProxyService,
                                 OtpService otpService,
-                                YoudoTariffChecker youdoTariffChecker) {
+                                YoudoTariffChecker youdoTariffChecker,
+                                YouDoLoginCaptcha youDoLoginCaptcha,
+                                YouDoSmartCaptchaSupport smartCaptchaSupport) {
         super(assignedProxyService);
         this.otpService = otpService;
         this.youdoTariffChecker = youdoTariffChecker;
+        this.youDoLoginCaptcha = youDoLoginCaptcha;
+        this.smartCaptchaSupport = smartCaptchaSupport;
     }
 
     @Override
@@ -110,30 +148,22 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
 
         dismissCookieBanner(page);
 
-        if (!clickLoginButton(page)) {
+        if (!clickHeaderLoginUntilModal(page, creds.login())) {
             report(Level.WARN, log,
-                    String.format("АВТООТВЕТ: %s -> НЕ НАЙДЕНА КНОПКА 'Войти', пользователь: %s",
+                    String.format("АВТООТВЕТ: %s -> НЕ ОТКРЫЛАСЬ МОДАЛКА ВХОДА, пользователь: %s",
                             getSiteName(), creds.login()),
                     AutoreplyErrorTypes.BUTTON_NOT_FOUND);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Кнопка 'Войти' не найдена", captureScreenshot(page));
+            return StepResult.fail(StepType.SEND_AUTOREPLY, "Не открылась модалка входа YouDo", captureScreenshot(page));
         }
-        log.info("АВТООТВЕТ: {} -> кнопка 'Войти' нажата, пользователь: {}", getSiteName(), creds.login());
+        log.info("АВТООТВЕТ: {} -> модалка входа открыта, пользователь: {}", getSiteName(), creds.login());
 
-        if (!waitForLoginModal(page)) {
+        if (!openEmailLoginStep(page, creds.login())) {
             report(Level.WARN, log,
-                    "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНА КНОПКА 'Войти через email', пользователь: " + creds.login(),
+                    "АВТООТВЕТ: " + getSiteName() + " -> НЕ УДАЛОСЬ ПЕРЕЙТИ К ВХОДУ ПО EMAIL, пользователь: " + creds.login(),
                     AutoreplyErrorTypes.BUTTON_NOT_FOUND);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Кнопка 'Войти через email' не найдена", captureScreenshot(page));
+            return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось открыть вход по email", captureScreenshot(page));
         }
-        log.info("АВТООТВЕТ: {} -> кнопка 'Войти через email' появилась, пользователь: {}", getSiteName(), creds.login());
-
-        if (!clickWithFallback(page, LOGIN_EMAIL_BUTTON_SELECTORS, 8000, "Кнопка 'Войти через email'")) {
-            report(Level.WARN, log,
-                    "АВТООТВЕТ: " + getSiteName() + " -> НЕ УДАЛОСЬ НАЖАТЬ КНОПКУ 'Войти через email', пользователь: " + creds.login(),
-                    AutoreplyErrorTypes.BUTTON_NOT_FOUND);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось нажать кнопку 'Войти через email'", captureScreenshot(page));
-        }
-        log.info("АВТООТВЕТ: {} -> кнопка 'Войти через email' нажата, пользователь: {}", getSiteName(), creds.login());
+        log.info("АВТООТВЕТ: {} -> форма email доступна, пользователь: {}", getSiteName(), creds.login());
 
         // Ожидание поля ввода email
         if (!waitOrFail(page, "input[name='login']", "Поле email")) {
@@ -155,7 +185,27 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось заполнить email: " + e.getMessage(), captureScreenshot(page));
         }
 
-        // Клик по кнопке "Далее"
+        youDoLoginCaptcha.beginNetworkCapture(page);
+        try {
+            return loginAfterEmailFilled(page, payload, creds);
+        } finally {
+            youDoLoginCaptcha.endNetworkCapture(page);
+        }
+    }
+
+    private StepResult<Void> loginAfterEmailFilled(Page page, AiNotificationPayload payload, DecryptedCredential creds) {
+        StepResult<Void> pre = runYouDoLoginStageLoop(page, creds, true, false);
+        if (pre != null && pre.failed()) {
+            return pre;
+        }
+        if (detectYouDoLoginStage(page) == YouDoLoginStage.LOGGED_IN) {
+            log.info("АВТООТВЕТ: {} -> ЛОГИН УСПЕШЕН (без OTP), пользователь: {}", getSiteName(), creds.login());
+            return StepResult.ok(StepType.SEND_AUTOREPLY, null);
+        }
+
+        otpService.beginOtpWait(SiteName.YOUDO.name(), creds.login());
+        log.info("АВТООТВЕТ: {} -> OTP wait начат, нажимаем «Далее», пользователь: {}", getSiteName(), creds.login());
+
         if (!clickOrFail(page, "button:has-text('Далее')", "Кнопка 'Далее'")) {
             report(Level.WARN, log,
                     "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНА КНОПКА 'Далее', пользователь: " + creds.login(),
@@ -164,15 +214,14 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         }
         log.info("АВТООТВЕТ: {} -> кнопка 'Далее' нажата, пользователь: {}", getSiteName(), creds.login());
 
-        if (waitForEmailError(page, 5000)) {
-            report(Level.WARN, log,
-                    "АВТООТВЕТ: " + getSiteName() + " -> НЕПРАВИЛЬНЫЙ АДРЕС ЭЛЕКТРОННОЙ ПОЧТЫ, пользователь: " + creds.login(),
-                    AutoreplyErrorTypes.EMAIL_INVALID);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, EMAIL_ERROR_MESSAGE, captureScreenshot(page));
+        waitAfterYouDoNextClick(page);
+
+        StepResult<Void> gates = runYouDoLoginStageLoop(page, creds, false, true);
+        if (gates != null && gates.failed()) {
+            return gates;
         }
 
-        // Ожидание поля ввода OTP
-        if (!waitOrFail(page, "input[name='code']", "Поле ввода кода")) {
+        if (!isOtpFieldVisible(page)) {
             if (isEmailErrorPresent(page)) {
                 report(Level.WARN, log,
                         "АВТООТВЕТ: " + getSiteName() + " -> НЕПРАВИЛЬНЫЙ АДРЕС ЭЛЕКТРОННОЙ ПОЧТЫ, пользователь: " + creds.login(),
@@ -185,7 +234,6 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Поле ввода кода не найдено", captureScreenshot(page));
         }
 
-        // Получение OTP
         log.info("АВТООТВЕТ: {} -> ожидание OTP для {}", getSiteName(), creds.login());
         String otp = otpService.waitForOtp(SiteName.YOUDO.name(), creds.login(), otpValidationTimeoutMs);
         if (otp == null) {
@@ -197,7 +245,15 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         log.info("АВТООТВЕТ: {} -> OTP получен для пользователя: {}", getSiteName(), creds.login());
         setOtp(payload, otp, true);
 
-        // Заполнение поля OTP
+        if (page.isClosed()) {
+            report(Level.WARN, log,
+                    "АВТООТВЕТ: " + getSiteName() + " -> браузер закрыт до ввода OTP, пользователь: " + creds.login(),
+                    AutoreplyErrorTypes.FIELD_NOT_FOUND);
+            return StepResult.fail(StepType.SEND_AUTOREPLY,
+                    "Браузер закрыт до ввода OTP (не закрывайте окно Playwright во время ожидания кода)",
+                    (byte[]) null);
+        }
+
         try {
             page.fill("input[name='code']", otp);
             log.info("АВТООТВЕТ: {} -> OTP заполнен для пользователя: {}", getSiteName(), creds.login());
@@ -209,16 +265,25 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось заполнить OTP: " + e.getMessage(), captureScreenshot(page));
         }
 
-        // Ожидание загрузки страницы после ввода OTP
+        gates = runYouDoLoginStageLoop(page, creds, false, false);
+        if (gates != null && gates.failed()) {
+            return gates;
+        }
+
         try {
             page.waitForLoadState(LoadState.NETWORKIDLE);
             log.info("АВТООТВЕТ: {} -> страница загружена после ввода OTP, пользователь: {}", getSiteName(), creds.login());
         } catch (Exception e) {
-            report(Level.WARN, log,
-                    "АВТООТВЕТ: " + getSiteName() + " -> НЕ УДАЛОСЬ ДОЖДАТЬСЯ ЗАГРУЗКИ ПОСЛЕ OTP, пользователь: "
-                            + creds.login() + ", ошибка: " + e.getMessage(),
-                    AutoreplyErrorTypes.TIMEOUT);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось дождаться загрузки после OTP: " + e.getMessage(), captureScreenshot(page));
+            if (!isYouDoLoggedIn(page)) {
+                report(Level.WARN, log,
+                        "АВТООТВЕТ: " + getSiteName() + " -> НЕ УДАЛОСЬ ДОЖДАТЬСЯ ЗАГРУЗКИ ПОСЛЕ OTP, пользователь: "
+                                + creds.login() + ", ошибка: " + e.getMessage(),
+                        AutoreplyErrorTypes.TIMEOUT);
+                return StepResult.fail(StepType.SEND_AUTOREPLY,
+                        "Не удалось дождаться загрузки после OTP: " + e.getMessage(), captureScreenshot(page));
+            }
+            log.debug("АВТООТВЕТ: {} -> NETWORKIDLE не достигнут после OTP, продолжаем, пользователь: {}",
+                    getSiteName(), creds.login());
         }
 
         log.info("АВТООТВЕТ: {} -> ЛОГИН УСПЕШЕН, пользователь: {}", getSiteName(), creds.login());
@@ -227,42 +292,815 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         return StepResult.ok(StepType.SEND_AUTOREPLY, null);
     }
 
-    private void dismissCookieBanner(Page page) {
+    /**
+     * Цикл этапов входа (как {@link FlRuAutoreplyParser#runLoginStageLoop}):
+     * SmartCaptcha и OTP могут чередоваться после «Далее».
+     *
+     * @param allowEmailForm {@code true} — остановка на форме email без ошибки (ещё не жали «Далее»)
+     * @param otpWaitArmed   {@code true} если {@link OtpService#beginOtpWait} уже вызван перед «Далее»
+     * @return {@code null} при успехе; иначе ошибка шага
+     */
+    private StepResult<Void> runYouDoLoginStageLoop(Page page, DecryptedCredential creds,
+                                                    boolean allowEmailForm, boolean otpWaitArmed) {
+        int captchaHandled = 0;
+        int postCaptchaNextClicks = 0;
+        for (int i = 1; i <= YOUDO_LOGIN_STAGE_MAX_ITERATIONS; i++) {
+            YouDoLoginStage stage = detectYouDoLoginStage(page);
+            // Как на FL.ru: капча может всплыть на любом шаге — приоритет над формой/UNKNOWN.
+            if (stage != YouDoLoginStage.SMART_CAPTCHA
+                    && stage != YouDoLoginStage.LOGGED_IN
+                    && smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                stage = YouDoLoginStage.SMART_CAPTCHA;
+            }
+            log.info("АВТООТВЕТ: {} -> этап входа {}/{}: {} url={}, пользователь: {}",
+                    getSiteName(), i, YOUDO_LOGIN_STAGE_MAX_ITERATIONS, stage, page.url(), creds.login());
+
+            switch (stage) {
+                case SMART_CAPTCHA -> {
+                    captchaHandled++;
+                    if (captchaHandled > 5) {
+                        return failYouDoCaptcha(page, creds.login(),
+                                "YouDo SmartCaptcha: слишком много повторов капчи");
+                    }
+                    if (!smartCaptchaSupport.passLoginSmartCaptcha(page, creds.login())) {
+                        return failYouDoCaptcha(page, creds.login(),
+                                "YouDo SmartCaptcha не пройдена (чекбокс / калейдоскоп)");
+                    }
+                    captchaService.resumeYandexSmartCaptchaForForm(page);
+                    captchaService.dismissSmartCaptchaOverlay(page);
+                    page.waitForTimeout(400);
+                    if (otpWaitArmed) {
+                        tryResumeYouDoEmailSubmitAfterCaptcha(page);
+                        StepResult<Void> stuck = handlePostCaptchaEmailSubmit(page, creds, postCaptchaNextClicks);
+                        if (stuck != null) {
+                            return stuck;
+                        }
+                        if (isOtpFieldVisible(page)) {
+                            return null;
+                        }
+                    }
+                }
+                case EMAIL_ERROR -> {
+                    report(Level.WARN, log,
+                            "АВТООТВЕТ: " + getSiteName() + " -> НЕПРАВИЛЬНЫЙ АДРЕС ЭЛЕКТРОННОЙ ПОЧТЫ, пользователь: "
+                                    + creds.login(),
+                            AutoreplyErrorTypes.EMAIL_INVALID);
+                    return StepResult.fail(StepType.SEND_AUTOREPLY, EMAIL_ERROR_MESSAGE, captureScreenshot(page));
+                }
+                case OTP_CODE -> {
+                    if (otpWaitArmed) {
+                        return null;
+                    }
+                    page.waitForTimeout(500);
+                }
+                case EMAIL_FORM -> {
+                    if (allowEmailForm) {
+                        return null;
+                    }
+                    if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                        page.waitForTimeout(500);
+                        continue;
+                    }
+                    if (otpWaitArmed) {
+                        if (isOtpFieldVisible(page)) {
+                            return null;
+                        }
+                        StepResult<Void> stuck = handlePostCaptchaEmailSubmit(page, creds, postCaptchaNextClicks);
+                        if (stuck != null) {
+                            return stuck;
+                        }
+                        if (isOtpFieldVisible(page)) {
+                            return null;
+                        }
+                        if (isYouDoEmailSubmitLoading(page)) {
+                            log.info("АВТООТВЕТ: {} -> ждём ответ сервера после «Далее» (спиннер), пользователь: {}",
+                                    getSiteName(), creds.login());
+                            waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
+                            if (isYouDoEmailSubmitLoading(page) && !isOtpFieldVisible(page)) {
+                                return failYouDoEmailSubmitStuck(page, creds.login());
+                            }
+                            continue;
+                        }
+                        if (postCaptchaNextClicks < YOUDO_POST_CAPTCHA_NEXT_MAX
+                                && hasYouDoSmartTokenForSubmit(page)
+                                && isYouDoNextButtonClickable(page)) {
+                            postCaptchaNextClicks++;
+                            log.info("АВТООТВЕТ: {} -> после капчи одна отправка «Далее» ({}/{}), пользователь: {}",
+                                    getSiteName(), postCaptchaNextClicks, YOUDO_POST_CAPTCHA_NEXT_MAX, creds.login());
+                            if (clickYouDoNextButton(page)) {
+                                waitAfterYouDoNextClick(page);
+                                waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
+                            }
+                            continue;
+                        }
+                        if (postCaptchaNextClicks >= YOUDO_POST_CAPTCHA_NEXT_MAX
+                                && isEmailFieldVisible(page)
+                                && !isOtpFieldVisible(page)) {
+                            return failYouDoEmailSubmitStuck(page, creds.login());
+                        }
+                        waitForYouDoLoginProgress(page, 8_000);
+                        continue;
+                    }
+                    report(Level.WARN, log,
+                            "АВТООТВЕТ: " + getSiteName() + " -> ВХОД НЕ ВЫПОЛНЕН, остались на форме email, пользователь: "
+                                    + creds.login(),
+                            AutoreplyErrorTypes.LOGIN_FAILED);
+                    return StepResult.fail(StepType.SEND_AUTOREPLY, "Остались на форме email после «Далее»",
+                            captureScreenshot(page));
+                }
+                case LOGGED_IN -> {
+                    return null;
+                }
+                case UNKNOWN -> {
+                    page.waitForTimeout(700);
+                    if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                        captchaService.waitForYandexSmartCaptchaWidget(page, 12_000);
+                        captchaService.revealOffScreenSmartCaptchaHosts(page);
+                        continue;
+                    }
+                    if (otpWaitArmed && !isEmailFieldVisible(page) && !isOtpFieldVisible(page)
+                            && shouldRestoreYouDoEmailFormAfterCaptcha(page)) {
+                        restoreYouDoEmailFormAfterCaptcha(page, creds);
+                    }
+                    YouDoLoginStage again = detectYouDoLoginStage(page);
+                    if (again != YouDoLoginStage.UNKNOWN) {
+                        continue;
+                    }
+                    if (otpWaitArmed && isOtpFieldVisible(page)) {
+                        return null;
+                    }
+                    if (otpWaitArmed && i >= 6 && !smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                        log.warn("АВТООТВЕТ: {} -> неизвестный этап после «Далее», url={}, пользователь: {}",
+                                getSiteName(), page.url(), creds.login());
+                        return StepResult.fail(StepType.SEND_AUTOREPLY, "YOUDO_LOGIN_UNKNOWN_STAGE",
+                                "YouDo: неизвестный экран после «Далее»: " + page.url(), captureScreenshot(page));
+                    }
+                    if (!otpWaitArmed && i >= 3) {
+                        return null;
+                    }
+                }
+                default -> page.waitForTimeout(300);
+            }
+        }
+        if (otpWaitArmed && isEmailFieldVisible(page) && !isOtpFieldVisible(page)) {
+            return failYouDoEmailSubmitStuck(page, creds.login());
+        }
+        return StepResult.fail(StepType.SEND_AUTOREPLY, "YOUDO_LOGIN_STAGE_LOOP",
+                YOUDO_STAGE_LOOP_EXHAUSTED_MESSAGE, captureScreenshot(page));
+    }
+
+    /**
+     * После капчи: не кликать «Далее», пока крутится спиннер; дождаться OTP или одной повторной отправки.
+     */
+    private StepResult<Void> handlePostCaptchaEmailSubmit(Page page, DecryptedCredential creds,
+                                                          int postCaptchaNextClicks) {
+        if (isOtpFieldVisible(page) || isYouDoLoggedIn(page)) {
+            return null;
+        }
+        if (isYouDoEmailSubmitLoading(page)) {
+            log.info("АВТООТВЕТ: {} -> капча снята, ждём завершение запроса email, пользователь: {}",
+                    getSiteName(), creds.login());
+            waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
+            if (isOtpFieldVisible(page) || isYouDoLoggedIn(page)) {
+                return null;
+            }
+            if (isYouDoEmailSubmitLoading(page) && hasYouDoSmartTokenForSubmit(page)) {
+                log.info("АВТООТВЕТ: {} -> спиннер после smart-token, возобновляем отправку email, пользователь: {}",
+                        getSiteName(), creds.login());
+                captchaService.resumeYandexSmartCaptchaForForm(page);
+                captchaService.dismissSmartCaptchaOverlay(page);
+                page.waitForTimeout(600);
+                tryResumeYouDoEmailSubmitAfterCaptcha(page);
+                waitForYouDoLoginProgress(page, 28_000);
+            }
+            if (isYouDoEmailSubmitLoading(page) && hasYouDoSmartTokenForSubmit(page)) {
+                log.info("АВТООТВЕТ: {} -> спиннер не снялся, force «Далее» после капчи, пользователь: {}",
+                        getSiteName(), creds.login());
+                forceClickYouDoNextAfterCaptcha(page);
+                waitForYouDoLoginProgress(page, 20_000);
+            }
+            if (isYouDoEmailSubmitLoading(page) && !isOtpFieldVisible(page)) {
+                return failYouDoEmailSubmitStuck(page, creds.login());
+            }
+            return null;
+        }
+        if (postCaptchaNextClicks >= YOUDO_POST_CAPTCHA_NEXT_MAX) {
+            return null;
+        }
+        if (!hasYouDoSmartTokenForSubmit(page) || !isYouDoNextButtonClickable(page)) {
+            waitForYouDoLoginProgress(page, 12_000);
+            return null;
+        }
+        return null;
+    }
+
+    /** Сброс зависшего спиннера и повтор «Далее» после внешнего smart-token. */
+    private void tryResumeYouDoEmailSubmitAfterCaptcha(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        captchaService.resumeYandexSmartCaptchaForForm(page);
+        captchaService.dismissSmartCaptchaOverlay(page);
         try {
-            Locator cookieBtn = page.getByRole(AriaRole.BUTTON, new Page.GetByRoleOptions().setName("Хорошо"));
-            cookieBtn.waitFor(new Locator.WaitForOptions().setTimeout(3000));
-            cookieBtn.click();
-            log.info("АВТООТВЕТ: {} -> cookie-баннер закрыт", getSiteName());
+            page.evaluate(
+                    """
+                            () => {
+                              for (const b of document.querySelectorAll('button')) {
+                                if (b.offsetParent === null) continue;
+                                const text = (b.textContent || '').trim();
+                                if (!text.includes('Далее')) continue;
+                                b.disabled = false;
+                                b.removeAttribute('aria-busy');
+                                b.classList.remove('disabled');
+                              }
+                            }
+                            """);
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> сброс спиннера «Далее»: {}", getSiteName(), e.getMessage());
+        }
+        if (!isYouDoEmailSubmitLoading(page) && isYouDoNextButtonClickable(page)) {
+            clickYouDoNextButton(page);
+            waitAfterYouDoNextClick(page);
+            return;
+        }
+        if (isYouDoEmailSubmitLoading(page) && isYouDoNextButtonClickable(page)) {
+            clickYouDoNextButton(page);
+            waitAfterYouDoNextClick(page);
+            return;
+        }
+        if (hasYouDoSmartTokenForSubmit(page)) {
+            forceClickYouDoNextAfterCaptcha(page);
+        }
+    }
+
+    /** Повтор «Далее» при зависшем спиннере после smart-token (обычный клик блокируется isYouDoEmailSubmitLoading). */
+    private void forceClickYouDoNextAfterCaptcha(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        try {
+            page.evaluate(
+                    """
+                            () => {
+                              for (const b of document.querySelectorAll('button')) {
+                                if (b.offsetParent === null) continue;
+                                const text = (b.textContent || '').trim();
+                                if (!text.includes('Далее')) continue;
+                                b.disabled = false;
+                                b.removeAttribute('aria-busy');
+                                b.classList.remove('disabled');
+                                const spin = b.querySelector('[class*="Loader"], [class*="loader"], [class*="Spinner"], [class*="spinner"], svg');
+                                if (spin) spin.remove();
+                              }
+                            }
+                            """);
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> сброс спиннера force «Далее»: {}", getSiteName(), e.getMessage());
+        }
+        try {
+            Locator next = page.locator("button:has-text('Далее')").first();
+            if (next.count() > 0 && next.isVisible()) {
+                getCurrentManager().humanDelay(page);
+                next.click(new Locator.ClickOptions().setForce(true).setTimeout(8_000));
+                log.info("АВТООТВЕТ: {} -> force-клик «Далее» после капчи", getSiteName());
+                waitAfterYouDoNextClick(page);
+            }
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> force «Далее» не удался: {}", getSiteName(), e.getMessage());
+        }
+    }
+
+    private void waitAfterYouDoNextClick(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+            captchaService.waitForYandexSmartCaptchaWidget(page, 15_000);
+            captchaService.revealOffScreenSmartCaptchaHosts(page);
+            page.waitForTimeout(400);
+        } else if (hasYouDoSmartTokenForSubmit(page)) {
+            page.waitForTimeout(600);
+        } else {
+            captchaService.waitForYandexSmartCaptchaWidget(page, 6_000);
+            page.waitForTimeout(400);
+        }
+    }
+
+    private boolean hasYouDoSmartTokenForSubmit(Page page) {
+        return captchaService != null && captchaService.smartCaptchaTokenLength(page) > 20;
+    }
+
+    private boolean clickYouDoNextButton(Page page) {
+        if (isYouDoEmailSubmitLoading(page)) {
+            return false;
+        }
+        return clickOrFail(page, "button:has-text('Далее')", "Кнопка 'Далее' после капчи");
+    }
+
+    private boolean isYouDoNextButtonClickable(Page page) {
+        if (page == null || page.isClosed() || isYouDoEmailSubmitLoading(page)) {
+            return false;
+        }
+        try {
+            Locator next = page.locator("button:has-text('Далее')").first();
+            return next.count() > 0 && next.isVisible() && next.isEnabled();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean isYouDoEmailSubmitLoading(Page page) {
+        if (page == null || page.isClosed()) {
+            return false;
+        }
+        try {
+            Object loading = page.evaluate(
+                    """
+                            () => {
+                              const login = document.querySelector('input[name="login"]');
+                              if (!login || login.offsetParent === null) return false;
+                              const buttons = [...document.querySelectorAll('button')]
+                                .filter(b => b.offsetParent !== null);
+                              for (const b of buttons) {
+                                const text = (b.textContent || '').trim();
+                                if (text.includes('Назад')) continue;
+                                const r = b.getBoundingClientRect();
+                                if (r.width < 50 || r.height < 24) continue;
+                                const busy = b.disabled || b.getAttribute('aria-busy') === 'true'
+                                  || b.querySelector('svg, [class*="Loader"], [class*="loader"], [class*="Spinner"], [class*="spinner"]');
+                                if (busy && (text.includes('Далее') || !text)) return true;
+                              }
+                              return false;
+                            }
+                            """);
+            return Boolean.TRUE.equals(loading);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Ждём OTP, ошибку email, капчу или окончание спиннера на «Далее». */
+    private boolean waitForYouDoLoginProgress(Page page, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (isOtpFieldVisible(page) || isYouDoLoggedIn(page) || isEmailErrorPresent(page)) {
+                return true;
+            }
+            if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                return true;
+            }
+            if (!isYouDoEmailSubmitLoading(page) && !isEmailFieldVisible(page)) {
+                return true;
+            }
+            page.waitForTimeout(450);
+        }
+        return isOtpFieldVisible(page) || isYouDoLoggedIn(page);
+    }
+
+    /**
+     * Не переоткрываем модалку, если идёт submit, есть smart-token или ещё виден чекбокс капчи.
+     */
+    private boolean shouldRestoreYouDoEmailFormAfterCaptcha(Page page) {
+        if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+            return false;
+        }
+        if (hasYouDoSmartTokenForSubmit(page) || isYouDoEmailSubmitLoading(page)) {
+            return false;
+        }
+        return true;
+    }
+
+    /** После капчи модалка иногда закрывается — снова открываем email и заполняем. */
+    private void restoreYouDoEmailFormAfterCaptcha(Page page, DecryptedCredential creds) {
+        if (page == null || page.isClosed() || isEmailFieldVisible(page) || isOtpFieldVisible(page)) {
+            return;
+        }
+        log.info("АВТООТВЕТ: {} -> восстановление формы email после капчи, пользователь: {}",
+                getSiteName(), creds.login());
+        dismissCookieBanner(page);
+        clickHeaderLoginUntilModal(page, creds.login());
+        openEmailLoginStep(page, creds.login());
+        if (!isEmailFieldVisible(page)) {
+            return;
+        }
+        try {
+            String current = page.locator("input[name='login']").first().inputValue();
+            if (current == null || current.isBlank() || !current.equals(creds.login())) {
+                page.fill("input[name='login']", creds.login());
+                log.info("АВТООТВЕТ: {} -> email повторно заполнен: {}", getSiteName(), creds.login());
+            }
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> не удалось повторно заполнить email: {}", getSiteName(), e.getMessage());
+        }
+    }
+
+    private StepResult<Void> failYouDoEmailSubmitStuck(Page page, String login) {
+        report(Level.WARN, log,
+                "АВТООТВЕТ: " + getSiteName() + " -> зависла отправка email после капчи, пользователь: " + login,
+                AutoreplyErrorTypes.TIMEOUT);
+        return StepResult.fail(StepType.SEND_AUTOREPLY, YOUDO_EMAIL_SUBMIT_STUCK_CODE,
+                YOUDO_EMAIL_SUBMIT_STUCK_MESSAGE, captureScreenshot(page));
+    }
+
+    /**
+     * Приоритет: SmartCaptcha → ошибка email → OTP → форма email → logged-in.
+     */
+    private YouDoLoginStage detectYouDoLoginStage(Page page) {
+        if (page == null || page.isClosed()) {
+            return YouDoLoginStage.UNKNOWN;
+        }
+        if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+            return YouDoLoginStage.SMART_CAPTCHA;
+        }
+        if (isEmailErrorPresent(page)) {
+            return YouDoLoginStage.EMAIL_ERROR;
+        }
+        if (isOtpFieldVisible(page)) {
+            return YouDoLoginStage.OTP_CODE;
+        }
+        if (isEmailFieldVisible(page)) {
+            return YouDoLoginStage.EMAIL_FORM;
+        }
+        if (isYouDoLoggedIn(page)) {
+            return YouDoLoginStage.LOGGED_IN;
+        }
+        return YouDoLoginStage.UNKNOWN;
+    }
+
+    private boolean isOtpFieldVisible(Page page) {
+        String[] selectors = {
+                "input[name='code']",
+                "input[autocomplete='one-time-code']",
+                "input[inputmode='numeric'][name='code']"
+        };
+        for (String selector : selectors) {
+            try {
+                Locator code = page.locator(selector).first();
+                if (code.count() > 0 && code.isVisible()) {
+                    return true;
+                }
+            } catch (Exception ignored) {
+                // next
+            }
+        }
+        try {
+            return page.locator("text=код из письма").first().isVisible()
+                    || page.locator("text=Введите код").first().isVisible();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean isEmailFieldVisible(Page page) {
+        try {
+            Locator email = page.locator("input[name='login']").first();
+            return email.count() > 0 && email.isVisible();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean isYouDoLoggedIn(Page page) {
+        try {
+            if (isOtpFieldVisible(page) || isEmailFieldVisible(page)
+                    || smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                return false;
+            }
+            Locator loginBtn = page.locator("[data-test='LoginButton']");
+            return loginBtn.count() == 0 || !loginBtn.first().isVisible();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private StepResult<Void> failYouDoCaptcha(Page page, String login, String fallbackMessage) {
+        CaptchaFailureInfo info = captchaService != null
+                ? captchaService.getLastFailure().orElse(null)
+                : null;
+        String errorCode = info != null ? info.codeName() : AutoreplyErrorTypes.CAPTCHA_FAILED;
+        String message = info != null && info.userMessage() != null && !info.userMessage().isBlank()
+                ? info.userMessage()
+                : fallbackMessage;
+        report(Level.WARN, log,
+                "АВТООТВЕТ: " + getSiteName() + " -> капча не пройдена [" + errorCode + "], пользователь: " + login,
+                AutoreplyErrorTypes.CAPTCHA_FAILED);
+        return StepResult.fail(StepType.SEND_AUTOREPLY, errorCode, message, captureScreenshot(page));
+    }
+
+    @Override
+    protected StepResult<Void> finalizeBeforeSessionSave(Page page, DecryptedCredential creds,
+                                                         AutoreplyMode autoreplyMode) {
+        if (!smartCaptchaSupport.isLoginCaptchaGate(page)) {
+            return null;
+        }
+        if (!smartCaptchaSupport.passLoginSmartCaptcha(page, creds.login())) {
+            return failYouDoCaptcha(page, creds.login(), "YouDo SmartCaptcha не пройдена перед сохранением сессии");
+        }
+        return null;
+    }
+
+    private void dismissCookieBanner(Page page) {
+        if (page == null || page.isClosed() || !isYouDoCookieConsentVisible(page)) {
+            return;
+        }
+        String[] scopedSelectors = {
+                "[class*='Cookie'] button:has-text('Хорошо')",
+                "[id*='cookie' i] button:has-text('Хорошо')",
+                "[data-test*='cookie' i] button:has-text('Хорошо')"
+        };
+        for (String selector : scopedSelectors) {
+            try {
+                Locator btn = page.locator(selector).first();
+                if (btn.count() > 0 && btn.isVisible()) {
+                    btn.click(new Locator.ClickOptions().setTimeout(3000).setForce(true));
+                    log.info("АВТООТВЕТ: {} -> cookie-баннер закрыт", getSiteName());
+                    page.waitForTimeout(300);
+                    return;
+                }
+            } catch (Exception ignored) {
+                // next
+            }
+        }
+        try {
+            Object clicked = page.evaluate(
+                    """
+                            () => {
+                              const isLoginDialog = (el) => {
+                                if (!el) return false;
+                                const t = (el.textContent || '');
+                                return /Вход|Войти через|электронн/i.test(t);
+                              };
+                              const buttons = [...document.querySelectorAll('button')];
+                              for (const b of buttons) {
+                                if (b.offsetParent === null) continue;
+                                const text = (b.textContent || '').trim();
+                                if (!text.includes('Хорошо')) continue;
+                                const dialog = b.closest('[role="dialog"], [class*="Modal"]');
+                                if (dialog && isLoginDialog(dialog)) continue;
+                                const r = b.getBoundingClientRect();
+                                if (r.top < window.innerHeight * 0.45) continue;
+                                b.click();
+                                return true;
+                              }
+                              return false;
+                            }
+                            """);
+            if (Boolean.TRUE.equals(clicked)) {
+                log.info("АВТООТВЕТ: {} -> cookie-баннер закрыт (нижняя панель)", getSiteName());
+                page.waitForTimeout(300);
+            }
         } catch (Exception e) {
             log.debug("АВТООТВЕТ: {} -> cookie-баннер не найден или уже закрыт", getSiteName());
         }
     }
 
-    private boolean clickLoginButton(Page page) {
-        for (String selector : LOGIN_BUTTON_SELECTORS) {
-            try {
-                Locator locator = page.locator(selector).first();
-                locator.waitFor(new Locator.WaitForOptions()
-                        .setState(WaitForSelectorState.VISIBLE)
-                        .setTimeout(8000));
-                locator.scrollIntoViewIfNeeded();
-                clickLocator(locator);
-                log.info("АВТООТВЕТ: {} -> кнопка 'Войти' нажата (селектор: {})", getSiteName(), selector);
-                if (waitForLoginModal(page)) {
+    private boolean isYouDoCookieConsentVisible(Page page) {
+        try {
+            Object visible = page.evaluate(
+                    """
+                            () => {
+                              const roots = document.querySelectorAll(
+                                '[class*="Cookie"], [id*="cookie" i], [data-test*="cookie" i]');
+                              for (const root of roots) {
+                                if (root.offsetParent === null) continue;
+                                const btn = root.querySelector('button');
+                                if (btn && /Хорошо/i.test(btn.textContent || '')) return true;
+                              }
+                              for (const b of document.querySelectorAll('button')) {
+                                if (b.offsetParent === null) continue;
+                                if (!/Хорошо/.test((b.textContent || '').trim())) continue;
+                                const dialog = b.closest('[role="dialog"]');
+                                if (dialog && /Вход|Войти/i.test(dialog.textContent || '')) continue;
+                                const r = b.getBoundingClientRect();
+                                if (r.top > window.innerHeight * 0.45) return true;
+                              }
+                              return false;
+                            }
+                            """);
+            return Boolean.TRUE.equals(visible);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean isLoginWithEmailButtonVisible(Page page) {
+        return isAnySelectorVisible(page, LOGIN_EMAIL_BUTTON_SELECTORS);
+    }
+
+    private boolean isLoginModalOpen(Page page) {
+        if (isEmailFieldVisible(page)) {
+            return true;
+        }
+        if (isLoginWithEmailButtonVisible(page)) {
+            return true;
+        }
+        try {
+            Locator dialog = page.locator("div[role='dialog']").first();
+            if (dialog.count() > 0 && dialog.isVisible()) {
+                String text = dialog.innerText();
+                return text != null && (text.contains("Вход") || text.contains("Войти"));
+            }
+        } catch (Exception ignored) {
+            // fall through
+        }
+        return false;
+    }
+
+    private boolean clickHeaderLoginUntilModal(Page page, String login) {
+        dismissCookieBanner(page);
+        if (isLoginModalOpen(page)) {
+            return true;
+        }
+
+        long deadline = System.currentTimeMillis() + LOGIN_CLICK_RETRY_MS;
+        int round = 0;
+        while (System.currentTimeMillis() < deadline) {
+            round++;
+            dismissCookieBanner(page);
+            if (isLoginModalOpen(page)) {
+                return true;
+            }
+
+            boolean clicked = false;
+            for (String selector : LOGIN_BUTTON_SELECTORS) {
+                try {
+                    Locator locator = page.locator(selector).first();
+                    if (locator.count() == 0 || !locator.isVisible()) {
+                        continue;
+                    }
+                    locator.scrollIntoViewIfNeeded();
+                    getCurrentManager().humanDelay(page);
+                    clickLocator(locator);
+                    clicked = true;
+                    log.info("АВТООТВЕТ: {} -> кнопка 'Войти' нажата ({}), раунд {}, пользователь: {}",
+                            getSiteName(), selector, round, login);
+                    page.waitForTimeout(500);
+                    if (waitForLoginModalVisible(page, LOGIN_MODAL_WAIT_MS)) {
+                        return true;
+                    }
+                } catch (Exception e) {
+                    log.debug("АВТООТВЕТ: {} -> клик 'Войти' '{}': {}", getSiteName(), selector, e.getMessage());
+                }
+            }
+
+            if (!clicked) {
+                clickHeaderLoginViaJs(page, login);
+                page.waitForTimeout(600);
+                if (waitForLoginModalVisible(page, LOGIN_MODAL_WAIT_MS)) {
                     return true;
                 }
-                log.debug("АВТООТВЕТ: {} -> модалка логина не открылась после клика '{}'", getSiteName(), selector);
+            }
+            page.waitForTimeout(400);
+        }
+        return isLoginModalOpen(page);
+    }
+
+    private void clickHeaderLoginViaJs(Page page, String login) {
+        try {
+            Object ok = page.evaluate(
+                    """
+                            () => {
+                              const el = document.querySelector("header [data-test='LoginButton']")
+                                || document.querySelector("[data-test='LoginButton']");
+                              if (!el) return false;
+                              el.scrollIntoView({ block: 'center', inline: 'center' });
+                              el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                              if (typeof el.click === 'function') el.click();
+                              return true;
+                            }
+                            """);
+            if (Boolean.TRUE.equals(ok)) {
+                log.info("АВТООТВЕТ: {} -> кнопка 'Войти' (JS), пользователь: {}", getSiteName(), login);
+            }
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> JS-клик 'Войти': {}", getSiteName(), e.getMessage());
+        }
+    }
+
+    /** Ждём видимый контент модалки, не hidden nodes в DOM. */
+    private boolean waitForLoginModalVisible(Page page, int timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        dismissCookieBanner(page);
+        while (System.currentTimeMillis() < deadline) {
+            if (isLoginModalOpen(page)) {
+                return true;
+            }
+            page.waitForTimeout(200);
+        }
+        return isLoginModalOpen(page);
+    }
+
+    /** Модалка открыта → клик «Войти через email», пока не видно поле login. */
+    private boolean openEmailLoginStep(Page page, String login) {
+        dismissCookieBanner(page);
+        if (isEmailFieldVisible(page)) {
+            return true;
+        }
+
+        long deadline = System.currentTimeMillis() + LOGIN_CLICK_RETRY_MS;
+        int round = 0;
+        while (System.currentTimeMillis() < deadline) {
+            round++;
+            if (round == 1 || round % 6 == 0) {
+                dismissCookieBanner(page);
+            }
+            if (isEmailFieldVisible(page)) {
+                return true;
+            }
+
+            if (!isLoginWithEmailButtonVisible(page) && !isLoginModalOpen(page)) {
+                log.debug("АВТООТВЕТ: {} -> модалка входа пропала, снова «Войти», пользователь: {}",
+                        getSiteName(), login);
+                clickHeaderLoginUntilModal(page, login);
+            }
+
+            if (clickWithFallback(page, LOGIN_EMAIL_BUTTON_SELECTORS, 4_000, "Войти через email")
+                    || clickLoginWithEmailViaJs(page, login)) {
+                page.waitForTimeout(700);
+                if (isEmailFieldVisible(page)) {
+                    return true;
+                }
+            }
+
+            if (clickFirstVisible(page, LOGIN_EMAIL_BUTTON_SELECTORS, "Войти через email (повтор)")) {
+                page.waitForTimeout(700);
+                if (isEmailFieldVisible(page)) {
+                    return true;
+                }
+            }
+
+            try {
+                Locator byText = page.getByText("электронную почту", new Page.GetByTextOptions().setExact(false)).first();
+                if (byText.count() > 0 && byText.isVisible()) {
+                    clickLocator(byText);
+                    log.info("АВТООТВЕТ: {} -> клик по тексту «электронную почту», пользователь: {}", getSiteName(), login);
+                    page.waitForTimeout(700);
+                    if (isEmailFieldVisible(page)) {
+                        return true;
+                    }
+                }
             } catch (Exception e) {
-                log.debug("АВТООТВЕТ: {} -> кнопка 'Войти' не найдена через '{}': {}", getSiteName(), selector, e.getMessage());
+                log.debug("АВТООТВЕТ: {} -> клик «электронную почту»: {}", getSiteName(), e.getMessage());
+            }
+
+            page.waitForTimeout(400);
+        }
+        return isEmailFieldVisible(page);
+    }
+
+    private boolean clickLoginWithEmailViaJs(Page page, String login) {
+        try {
+            Object ok = page.evaluate(
+                    """
+                            () => {
+                              const sel = "[data-test='LoginWithEmailButton']";
+                              const el = document.querySelector(sel)
+                                || [...document.querySelectorAll('button')].find(b =>
+                                  /электронн|email/i.test((b.textContent || '')));
+                              if (!el || el.offsetParent === null) return false;
+                              el.scrollIntoView({ block: 'center', inline: 'center' });
+                              el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                              if (typeof el.click === 'function') el.click();
+                              return true;
+                            }
+                            """);
+            if (Boolean.TRUE.equals(ok)) {
+                log.info("АВТООТВЕТ: {} -> Войти через email (JS), пользователь: {}", getSiteName(), login);
+                return true;
+            }
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> JS «Войти через email»: {}", getSiteName(), e.getMessage());
+        }
+        return false;
+    }
+
+    private boolean clickFirstVisible(Page page, String[] selectors, String step) {
+        for (String selector : selectors) {
+            try {
+                Locator locator = page.locator(selector).first();
+                if (locator.count() == 0 || !locator.isVisible()) {
+                    continue;
+                }
+                locator.scrollIntoViewIfNeeded();
+                clickLocator(locator);
+                log.info("АВТООТВЕТ: {} -> {} (селектор: {})", getSiteName(), step, selector);
+                return true;
+            } catch (Exception e) {
+                log.debug("АВТООТВЕТ: {} -> {} '{}': {}", getSiteName(), step, selector, e.getMessage());
             }
         }
         return false;
     }
 
-    private boolean waitForLoginModal(Page page) {
-        for (String selector : LOGIN_EMAIL_BUTTON_SELECTORS) {
-            if (waitOrFail(page, selector, "Модалка логина")) {
-                return true;
+    private boolean isAnySelectorVisible(Page page, String... selectors) {
+        for (String selector : selectors) {
+            try {
+                Locator loc = page.locator(selector).first();
+                if (loc.count() > 0 && loc.isVisible()) {
+                    return true;
+                }
+            } catch (Exception ignored) {
+                // next
             }
         }
         return false;

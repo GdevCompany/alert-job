@@ -116,6 +116,7 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
     /** Этапы входа FL.ru: validate-captcha и код из письма могут появляться повторно. */
     private enum FlRuLoginStage {
         ANTI_DDOS,
+        SITE_MAINTENANCE,
         VALIDATE_CAPTCHA,
         EMAIL_CODE,
         LOGIN_ERROR,
@@ -345,6 +346,11 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
             log.info("АВТООТВЕТ: {} -> страница логина, url={}, пользователь: {}",
                     getSiteName(), page.url(), creds.login());
 
+            StepResult<Void> maintenance = failIfSiteMaintenance(page, creds.login());
+            if (maintenance != null) {
+                return maintenance;
+            }
+
             StepResult<Void> pre = runLoginStageLoop(page, creds, true, false);
             if (pre != null && pre.failed()) {
                 return pre;
@@ -386,7 +392,15 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
                 return afterSubmit;
             }
 
+            maintenance = failIfSiteMaintenance(page, creds.login());
+            if (maintenance != null) {
+                return maintenance;
+            }
+
             FlRuLoginStage stage = detectLoginStage(page);
+            if (stage == FlRuLoginStage.SITE_MAINTENANCE) {
+                return failIfSiteMaintenance(page, creds.login());
+            }
             if (stage == FlRuLoginStage.LOGGED_IN) {
                 log.info("АВТООТВЕТ: {} -> ЛОГИН УСПЕШЕН, пользователь: {}", getSiteName(), creds.login());
                 setOtp(payload, null, false);
@@ -434,6 +448,10 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
      * @return ошибка или {@code null} если форма отправлена
      */
     private StepResult<Void> fillAndSubmitLoginForm(Page page, DecryptedCredential creds) {
+        StepResult<Void> maintenance = failIfSiteMaintenance(page, creds.login());
+        if (maintenance != null) {
+            return maintenance;
+        }
         if (!waitOrFail(page, "input[name='username']", "Поле логина")) {
             ensureOnLoginPage(page, creds.login());
             if (!waitOrFail(page, "input[name='username']", "Поле логина")) {
@@ -509,7 +527,7 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
 
     /**
      * Определяет текущий этап экрана FL.ru.
-     * Приоритет: anti-ddos → validate-captcha → код из письма → ошибка логина → форма логина → logged-in.
+     * Приоритет: anti-ddos → техработы → validate-captcha → код из письма → ошибка логина → форма логина → logged-in.
      */
     private FlRuLoginStage detectLoginStage(Page page) {
         if (page == null) {
@@ -517,6 +535,9 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
         }
         if (FlRuPlaywrightGuards.isAntiDdosOrBotWall(page, captchaService)) {
             return FlRuLoginStage.ANTI_DDOS;
+        }
+        if (FlRuPlaywrightGuards.isSiteMaintenancePage(page)) {
+            return FlRuLoginStage.SITE_MAINTENANCE;
         }
         if (validateCaptchaSupport.isValidateCaptchaPage(page)) {
             return FlRuLoginStage.VALIDATE_CAPTCHA;
@@ -573,6 +594,9 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
             switch (stage) {
                 case ANTI_DDOS -> {
                     return failAntiDdosWall(page, creds);
+                }
+                case SITE_MAINTENANCE -> {
+                    return failIfSiteMaintenance(page, creds.login());
                 }
                 case VALIDATE_CAPTCHA -> {
                     validateHandled++;
@@ -900,6 +924,7 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
                     || stage == FlRuLoginStage.EMAIL_CODE
                     || stage == FlRuLoginStage.VALIDATE_CAPTCHA
                     || stage == FlRuLoginStage.ANTI_DDOS
+                    || stage == FlRuLoginStage.SITE_MAINTENANCE
                     || stage == FlRuLoginStage.LOGGED_IN) {
                 return;
             }

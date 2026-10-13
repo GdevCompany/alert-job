@@ -38,7 +38,8 @@ public final class AutoreplyFailurePolicy {
                      FLRU_VALIDATE_YANDEX,
                      FLRU_VALIDATE_UNKNOWN,
                      FLRU_LOGIN_YANDEX_ADVANCED,
-                     FLRU_LOGIN_YANDEX_UNKNOWN -> AutoreplyFailureAction.ROTATE_PROXY;
+                     FLRU_LOGIN_YANDEX_UNKNOWN,
+                     YOUDO_KALEIDOSCOPE_FAIL -> AutoreplyFailureAction.ROTATE_PROXY;
                 case FLRU_LOGIN_YANDEX_CHECKBOX,
                      CAPTCHA_GENERIC,
                      CAPTCHA_EXCEPTION -> AutoreplyFailureAction.RETRY_SAME;
@@ -50,7 +51,10 @@ public final class AutoreplyFailurePolicy {
         return switch (errorCode) {
             case AutoreplyErrorTypes.CAPTCHA_FAILED,
                  AutoreplyErrorTypes.TIMEOUT,
-                 AutoreplyErrorTypes.ERROR_OPEN_PAGE -> AutoreplyFailureAction.ROTATE_PROXY;
+                 AutoreplyErrorTypes.ERROR_OPEN_PAGE,
+                 "YOUDO_EMAIL_SUBMIT_STUCK",
+                 "YOUDO_LOGIN_STAGE_LOOP",
+                 "YOUDO_LOGIN_UNKNOWN_STAGE" -> AutoreplyFailureAction.ROTATE_PROXY;
             case AutoreplyErrorTypes.LOGIN_FAILED,
                  AutoreplyErrorTypes.OTP_NOT_RECEIVED,
                  AutoreplyErrorTypes.FIELD_NOT_FOUND,
