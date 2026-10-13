@@ -14,6 +14,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.net.InetAddress;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -137,21 +138,64 @@ public class AssignedProxyService {
      * Возвращает прокси для конкретного пользователя и модуля.
      */
     public ProxyCredentials getProxyForUserAndModule(String userUuid, Long moduleId) {
-        Map<Long, ProxyCredentials> userMap = userModuleProxyMap.get(userUuid);
-        if (userMap != null) {
-            ProxyCredentials proxy = userMap.get(moduleId);
-            if (proxy != null && (proxy.getState() == ProxyState.ACTIVE || proxy.getState() == ProxyState.WARMING_UP)) {
-                return proxy;
-            }
+        ProxyCredentials proxy = lookupActiveProxy(userUuid, moduleId);
+        if (proxy != null) {
+            return proxy;
         }
-        // Если прокси нет или нерабочий – перераспределяем на лету
-        log.warn("Прокси для пользователя {} модуля {} не найден или нерабочий, выполняем перераспределение", userUuid, moduleId);
-        reassignProxies();
-        Map<Long, ProxyCredentials> newUserMap = userModuleProxyMap.get(userUuid);
-        if (newUserMap != null) {
-            return newUserMap.get(moduleId);
+        log.warn("Прокси для пользователя {} модуля {} не найден или нерабочий, выполняем перераспределение",
+                userUuid, moduleId);
+        try {
+            reassignProxies().block(Duration.ofMinutes(5));
+        } catch (Exception e) {
+            log.warn("Перераспределение прокси не завершено: {}", e.getMessage());
+        }
+        return lookupActiveProxy(userUuid, moduleId);
+    }
+
+    /**
+     * Закреплённый прокси по сайту (если в задаче другой moduleId, чем в автоответе — см. логи module 1 vs 2).
+     */
+    public ProxyCredentials getProxyForUserAndSite(String userUuid, SiteName site) {
+        Map<Long, ProxyCredentials> userMap = userModuleProxyMap.get(userUuid);
+        if (userMap == null || userMap.isEmpty() || site == null) {
+            return null;
+        }
+        try {
+            List<ModuleSiteDto> modules = coreClient.getAutoReplyEnabledModules(userUuid);
+            if (modules == null) {
+                return null;
+            }
+            for (ModuleSiteDto dto : modules) {
+                if (!site.equals(SiteName.fromId(dto.getSiteId()))) {
+                    continue;
+                }
+                ProxyCredentials proxy = lookupActiveProxy(userUuid, dto.getModuleId());
+                if (proxy != null) {
+                    log.info("Прокси для {} по сайту {} (moduleId {} вместо запрошенного id модуля в payload)",
+                            userUuid, site, dto.getModuleId());
+                    return proxy;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Не удалось подобрать прокси по сайту {} для {}: {}", site, userUuid, e.getMessage());
         }
         return null;
+    }
+
+    private ProxyCredentials lookupActiveProxy(String userUuid, Long moduleId) {
+        Map<Long, ProxyCredentials> userMap = userModuleProxyMap.get(userUuid);
+        if (userMap == null || moduleId == null) {
+            return null;
+        }
+        ProxyCredentials proxy = userMap.get(moduleId);
+        if (proxy != null && isActiveProxyState(proxy.getState())) {
+            return proxy;
+        }
+        return null;
+    }
+
+    private static boolean isActiveProxyState(ProxyState state) {
+        return state == ProxyState.ACTIVE || state == ProxyState.WARMING_UP;
     }
 
     /**

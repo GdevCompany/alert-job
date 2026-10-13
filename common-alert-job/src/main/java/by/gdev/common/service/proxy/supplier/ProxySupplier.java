@@ -123,11 +123,13 @@ public class ProxySupplier {
         return proxies;
     }
 
-    // Получение только рабочих
+    /**
+     * Прокси, прошедшие проверку (для браузера и назначения).
+     * {@link ProxyState#NEW} не включаем — иначе после refresh SUPPLIER в пул попадают непроверенные WebShare.
+     */
     public synchronized List<ProxyCredentials> getWorkingProxies() {
         return proxies.stream()
                 .filter(p -> p.getState() == ProxyState.ACTIVE
-                        || p.getState() == ProxyState.NEW
                         || p.getState() == ProxyState.WARMING_UP)
                 .collect(Collectors.toList());
     }

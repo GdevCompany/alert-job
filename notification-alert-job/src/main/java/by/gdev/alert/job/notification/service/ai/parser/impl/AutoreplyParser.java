@@ -536,14 +536,16 @@ public abstract class AutoreplyParser {
             }
             return options;
         }
-        ProxyCredentials proxyCred = assignedProxyService.getProxyForUserAndModule(
-                payload.getUser().getUuid(),
-                payload.getModule().getId()
-        );
+        String userUuid = payload.getUser().getUuid();
+        Long moduleId = payload.getModule() != null ? payload.getModule().getId() : null;
+        ProxyCredentials proxyCred = assignedProxyService.getProxyForUserAndModule(userUuid, moduleId);
         if (proxyCred == null) {
-            proxyCred = managerResolver.getLocalManager().getProxyWithRetry(3, 500);
-            log.info("АВТООТВЕТ: {} -> нет закреплённого прокси, взят случайный: {}", site,
-                    proxyCred != null ? proxyCred.getHost() + ":" + proxyCred.getPort() : "нет активных");
+            proxyCred = assignedProxyService.getProxyForUserAndSite(userUuid, site);
+        }
+        if (proxyCred == null) {
+            proxyCred = assignedProxyService.pickWorkingProxyExcluding(site, state.triedHostPorts);
+            log.info("АВТООТВЕТ: {} -> нет закреплённого прокси, взят рабочий из пула: {}", site,
+                    proxyCred != null ? proxyCred.getHost() + ":" + proxyCred.getPort() : "нет проверенных");
         }
         state.lastUsed = proxyCred;
         if (state.lastUsed != null) {

@@ -31,6 +31,10 @@ public class YouDoSmartCaptchaSupport {
     @Value("${captcha.yandex.two-captcha-fallback:true}")
     private boolean yandexTwoCaptchaFallback;
 
+    /** YouDo: сначала 2Captcha для checkbox и advanced; локальный клик — только fallback. */
+    @Value("${captcha.youdo.two-captcha-first:true}")
+    private boolean youdoTwoCaptchaFirst;
+
     /**
      * Капча на любом шаге логина YouDo: видимая, скрытая (грузится), pending.
      * В т.ч. {@code data-sentry-component="SmartCaptcha"} до появления iframe.
@@ -167,6 +171,8 @@ public class YouDoSmartCaptchaSupport {
                     && !hasVisibleSmartCaptchaUi(page)
                     && !isActiveYouDoCaptchaChallenge(page)) {
                 log.info("YOUDO SmartCaptcha: smart-token в DOM, видимого challenge нет — пропускаем");
+                captchaService.logSmartCaptchaResolutionVerdict(page,
+                        "youdo-login-attempt-" + attempt + "-skip-token-in-dom user=" + login);
                 return true;
             }
             captchaService.waitForYandexSmartCaptchaWidget(page, 12_000);
@@ -177,18 +183,25 @@ public class YouDoSmartCaptchaSupport {
             captchaService.dismissSmartCaptchaOverlay(page);
             page.waitForTimeout(800);
             captchaService.logSmartCaptchaState(page, "youdo-login-attempt-" + attempt + "-after");
+            captchaService.logSmartCaptchaResolutionVerdict(page,
+                    "youdo-login-attempt-" + attempt + "-after user=" + login);
 
             if (!isSmartCaptchaStage(page)) {
                 captchaService.resumeYandexSmartCaptchaForForm(page);
                 captchaService.dismissSmartCaptchaOverlay(page);
                 log.info("YOUDO SmartCaptcha снята после попытки {}, пользователь: {}", attempt, login);
+                captchaService.logSmartCaptchaResolutionVerdict(page,
+                        "youdo-login-attempt-" + attempt + "-stage-clear user=" + login);
                 return true;
             }
             if (!progressed) {
                 log.warn("YOUDO SmartCaptcha: попытка {} не дала прогресса, пользователь: {}", attempt, login);
             }
         }
-        return !isLoginCaptchaGate(page);
+        boolean gateOpen = !isLoginCaptchaGate(page);
+        captchaService.logSmartCaptchaResolutionVerdict(page,
+                "youdo-login-final user=" + login + " gateOpen=" + gateOpen);
+        return gateOpen;
     }
 
     private boolean solveCurrentChallenge(Page page, String login, int attempt) {
@@ -200,7 +213,16 @@ public class YouDoSmartCaptchaSupport {
                 || captchaService.isYandexAdvancedUiVisible(page)
                 || captchaService.hasCapturedPuzzleTask(page);
 
-        if (checkboxUi) {
+        if (youdoTwoCaptchaFirst && captchaService.isTwoCaptchaConfigured()) {
+            log.info("YOUDO SmartCaptcha: 2Captcha primary (все типы), попытка {}, пользователь: {}",
+                    attempt, login);
+            any |= captchaService.solveYandexForYouDoViaTwoCaptcha(page);
+            if (!isSmartCaptchaStage(page)) {
+                return any;
+            }
+        }
+
+        if (checkboxUi && !youdoTwoCaptchaFirst) {
             log.info("YOUDO SmartCaptcha: сначала клик «Я не робот» (checkbox-iframe), попытка {}, пользователь: {}",
                     attempt, login);
             if (solveCheckbox(page)) {
@@ -264,6 +286,15 @@ public class YouDoSmartCaptchaSupport {
             return false;
         }
         captchaService.clearLastFailure();
+        if (youdoTwoCaptchaFirst && captchaService.isTwoCaptchaConfigured()) {
+            if (captchaService.solveYandexForYouDoViaTwoCaptcha(page)) {
+                page.waitForTimeout(1200);
+                if (!isSmartCaptchaStage(page) || captchaService.smartCaptchaTokenLength(page) > 20) {
+                    captchaService.resumeYandexSmartCaptchaForForm(page);
+                    return true;
+                }
+            }
+        }
         if (captchaService.clickCheckboxInSmartCaptchaIframe(page)) {
             page.waitForTimeout(1200);
             if (captchaService.smartCaptchaTokenLength(page) > 20) {

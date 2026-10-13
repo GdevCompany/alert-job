@@ -108,14 +108,16 @@ public abstract class AbstractAutoreplySessionVerifier implements AutoreplySessi
         if (!proxy) {
             return new BrowserLaunchOptions(null, headless, false, userEmail);
         }
-        ProxyCredentials proxyCred = assignedProxyService.getProxyForUserAndModule(
-                payload.getUser().getUuid(),
-                payload.getModule().getId()
-        );
+        String userUuid = payload.getUser().getUuid();
+        Long moduleId = payload.getModule() != null ? payload.getModule().getId() : null;
+        ProxyCredentials proxyCred = assignedProxyService.getProxyForUserAndModule(userUuid, moduleId);
         if (proxyCred == null) {
-            proxyCred = managerResolver.getLocalManager().getProxyWithRetry(3, 500);
-            log.info("SESSION-VERIFY: {} -> нет закреплённого прокси, взят случайный: {}", getSiteName(),
-                    proxyCred != null ? proxyCred.getHost() + ":" + proxyCred.getPort() : "нет активных");
+            proxyCred = assignedProxyService.getProxyForUserAndSite(userUuid, getSiteName());
+        }
+        if (proxyCred == null) {
+            proxyCred = assignedProxyService.pickWorkingProxyExcluding(getSiteName(), null);
+            log.info("SESSION-VERIFY: {} -> нет закреплённого прокси, взят рабочий из пула: {}", getSiteName(),
+                    proxyCred != null ? proxyCred.getHost() + ":" + proxyCred.getPort() : "нет проверенных");
         }
         return new BrowserLaunchOptions(proxyCred, headless, true, userEmail);
     }
