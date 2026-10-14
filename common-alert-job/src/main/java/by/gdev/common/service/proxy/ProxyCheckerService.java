@@ -24,6 +24,9 @@ import java.util.List;
 @Slf4j
 public class ProxyCheckerService {
 
+    /** После любой проверки — не запускать вторую полную сразу (обновление SUPPLIER при старте). */
+    private static volatile long lastCheckEndedAtMillis;
+
     private final ProxySupplier proxySupplier;
     private final IpGeoService ipGeoService;
 
@@ -54,10 +57,14 @@ public class ProxyCheckerService {
      * Проверка одного прокси. Если {@code countryFilter} = false — страна не определяется.
      */
     public void checkAndUpdateProxy(ProxyCredentials proxy, boolean countryFilter) {
+        checkAndUpdateProxy(proxy, countryFilter, false);
+    }
+
+    public void checkAndUpdateProxy(ProxyCredentials proxy, boolean countryFilter, boolean verbose) {
         if (countryFilter) {
             updateProxyCountry(proxy);
         }
-        boolean available = isProxyAvailable(proxy);
+        boolean available = isProxyAvailable(proxy, verbose);
         switch (proxy.getState()) {
             case NEW -> proxy.setState(available ? ProxyState.WARMING_UP : ProxyState.FAILED);
             case ACTIVE, WARMING_UP -> proxy.setState(available ? ProxyState.ACTIVE : ProxyState.QUARANTINE);
@@ -81,7 +88,8 @@ public class ProxyCheckerService {
         }
     }
 
-    private boolean isProxyAvailable(ProxyCredentials proxy) {
+    private boolean isProxyAvailable(ProxyCredentials proxy, boolean verbose) {
+        String lastError = null;
         for (int i = 0; i < connectAttempts; i++) {
             try (Socket socket = new Socket()) {
                 socket.connect(new InetSocketAddress(proxy.getHost(), proxy.getPort()), connectTimeoutMs);
@@ -89,16 +97,22 @@ public class ProxyCheckerService {
                     return true;
                 }
                 socket.setSoTimeout(tunnelReadTimeoutMs);
-                if (verifyHttpsTunnel(socket, proxy)) {
+                if (verifyHttpsTunnel(socket, proxy, verbose)) {
                     return true;
                 }
-                log.warn(
-                        "Попытка {} HTTPS CONNECT через прокси {}:{} к {}:{} не удалась (ответ не 200)",
-                        i + 1, proxy.getHost(), proxy.getPort(), tunnelHost, tunnelPort);
+                lastError = "HTTPS CONNECT ответ не 200";
+                if (verbose) {
+                    log.warn(
+                            "Попытка {} HTTPS CONNECT через прокси {}:{} к {}:{} не удалась (ответ не 200)",
+                            i + 1, proxy.getHost(), proxy.getPort(), tunnelHost, tunnelPort);
+                }
             } catch (Exception e) {
                 String phase = tunnelCheckEnabled ? "TCP/CONNECT" : "TCP";
-                log.warn("Попытка {} {} к прокси {}:{} не удалась: {}",
-                        i + 1, phase, proxy.getHost(), proxy.getPort(), e.getMessage());
+                lastError = e.getMessage();
+                if (verbose) {
+                    log.warn("Попытка {} {} к прокси {}:{} не удалась: {}",
+                            i + 1, phase, proxy.getHost(), proxy.getPort(), e.getMessage());
+                }
             }
             sleepBetweenAttempts();
         }
@@ -114,7 +128,7 @@ public class ProxyCheckerService {
     }
 
     /** HTTP CONNECT с Proxy-Authorization — проверка, что прокси реально проксирует HTTPS. */
-    private boolean verifyHttpsTunnel(Socket socket, ProxyCredentials proxy) throws IOException {
+    private boolean verifyHttpsTunnel(Socket socket, ProxyCredentials proxy, boolean verbose) throws IOException {
         String target = tunnelHost + ":" + tunnelPort;
         StringBuilder request = new StringBuilder(256);
         request.append("CONNECT ").append(target).append(" HTTP/1.1\r\n");
@@ -138,7 +152,7 @@ public class ProxyCheckerService {
             return false;
         }
         boolean ok = statusLine.contains(" 200");
-        if (!ok) {
+        if (!ok && verbose) {
             log.debug("Прокси {}:{} CONNECT {} → {}", proxy.getHost(), proxy.getPort(), target, statusLine.trim());
         }
         return ok;
@@ -161,49 +175,68 @@ public class ProxyCheckerService {
         return line.isEmpty() ? null : line.toString();
     }
 
-    public void checkAllProxies(boolean countryFilterEnabled) {
-        var proxies = proxySupplier.getProxies();
-        int working = 0;
-        int notWorking = 0;
-        for (ProxyCredentials proxy : proxies) {
-            checkAndUpdateProxy(proxy, countryFilterEnabled);
-
-            switch (proxy.getState()) {
-                case ACTIVE, WARMING_UP -> working++;
-                default -> notWorking++;
-            }
-        }
-        log.debug("Проверка прокси завершена. Статистика: РАБОЧИЕ = {}, НЕ РАБОЧИЕ = {}", working, notWorking);
+    public ProxyCheckSummary checkAllProxies(boolean countryFilterEnabled) {
+        return checkProxies(proxySupplier.getProxies(), countryFilterEnabled, false);
     }
+
+    public static boolean isWithinCheckGracePeriod(long graceMs) {
+        long ended = lastCheckEndedAtMillis;
+        return ended > 0 && System.currentTimeMillis() - ended < graceMs;
+    }
+
+    private static void markCheckEnded() {
+        lastCheckEndedAtMillis = System.currentTimeMillis();
+    }
+
+    public record ProxyCheckSummary(int total, int working, int notWorking) {}
 
     /**
      * Проверяет переданный список прокси, обновляя их состояние.
      *
      * @param proxies список прокси для проверки
      */
-    public void checkProxies(List<ProxyCredentials> proxies, boolean countryFilter) {
+    public ProxyCheckSummary checkProxies(List<ProxyCredentials> proxies, boolean countryFilter) {
+        return checkProxies(proxies, countryFilter, false);
+    }
+
+    /**
+     * @param verbose только первый прогон при старте — WARN/DEBUG по каждому прокси; иначе без построчного вывода
+     */
+    public ProxyCheckSummary checkProxies(List<ProxyCredentials> proxies, boolean countryFilter, boolean verbose) {
         int total = proxies.size();
         int working = 0;
         int notWorking = 0;
         int processed = 0;
-        int logInterval = Math.max(1, Math.min(20, total / 10));
+        int logInterval = verbose
+                ? Math.max(1, Math.min(20, total / 10))
+                : total;
 
-        if (tunnelCheckEnabled) {
+        if (verbose && tunnelCheckEnabled) {
             log.info("Проверка прокси: TCP + HTTPS CONNECT к {}:{}", tunnelHost, tunnelPort);
+        } else if (!verbose) {
+            log.debug("Проверка прокси (сводка): {} шт., tunnel={} → {}:{}",
+                    total, tunnelCheckEnabled, tunnelHost, tunnelPort);
         }
 
         for (ProxyCredentials proxy : proxies) {
-            checkAndUpdateProxy(proxy, countryFilter);
+            checkAndUpdateProxy(proxy, countryFilter, verbose);
             switch (proxy.getState()) {
                 case ACTIVE, WARMING_UP -> working++;
                 default -> notWorking++;
             }
             processed++;
             if (processed % logInterval == 0 || processed == total) {
-                log.info("Прогресс проверки: {}/{} прокси (рабочих: {}, нерабочих: {})",
-                        processed, total, working, notWorking);
+                if (verbose) {
+                    log.info("Прогресс проверки: {}/{} прокси (рабочих: {}, нерабочих: {})",
+                            processed, total, working, notWorking);
+                }
             }
         }
-        log.info("Проверка списка прокси завершена. Статистика: РАБОЧИЕ = {}, НЕ РАБОЧИЕ = {}", working, notWorking);
+        if (verbose) {
+            log.info("Проверка списка прокси завершена. Статистика: РАБОЧИЕ = {}, НЕ РАБОЧИЕ = {}",
+                    working, notWorking);
+        }
+        markCheckEnded();
+        return new ProxyCheckSummary(total, working, notWorking);
     }
 }

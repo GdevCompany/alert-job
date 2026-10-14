@@ -1165,9 +1165,11 @@ public class CaptchaService {
                 kaleidoscopeSolver.hasCapturedPuzzleTask(page));
 
         boolean ok = solveYandexSmartCaptchaViaToken(page);
+        log.info("SmartCaptcha/2Captcha advanced: YandexSmartCaptchaTaskProxyless → {}", ok ? "ok" : "не снято");
         if (!ok && yandexAudioEnabled) {
             log.info("SmartCaptcha/2Captcha: token не снял challenge — пробуем audio");
             ok = yandexAudioSolver.solve(page);
+            log.info("SmartCaptcha/2Captcha advanced: AudioTask → {}", ok ? "ok" : "не снято");
             if (ok && isSmartTokenPresentOnPage(page)) {
                 dismissSmartCaptchaOverlay(page);
             }
@@ -1175,6 +1177,7 @@ public class CaptchaService {
         if (!ok && yandexPazlEnabled && shouldUsePazlCaptcha(page)) {
             log.info("SmartCaptcha Pazl: включён captcha.yandex.pazl-enabled — PazlCaptchaTask");
             ok = kaleidoscopeSolver.solve(page);
+            log.info("SmartCaptcha/2Captcha advanced: PazlCaptchaTask → {}", ok ? "ok" : "не снято");
         }
         if (!ok) {
             recordFailure(page, CaptchaFailureCode.YOUDO_KALEIDOSCOPE_FAIL,
@@ -1200,17 +1203,25 @@ public class CaptchaService {
                         + (yandexPazlEnabled ? "; опц. PazlCaptchaTask" : ""));
         log.info("SmartCaptcha/YouDo/2Captcha: primary token (checkbox + advanced)");
         boolean ok = solveYandexSmartCaptchaViaToken(page);
+        log.info("SmartCaptcha/YouDo/2Captcha: YandexSmartCaptchaTaskProxyless → {}", ok ? "ok" : "не снято");
         if (ok && !isSmartCaptchaPending(page)) {
+            log.info("SmartCaptcha/YouDo/2Captcha: token снял challenge, pending=false — готово");
             logSmartCaptchaResolutionVerdict(page, "youdo-2captcha-all-token-ok");
             return true;
         }
         boolean advanced = isYandexAdvancedChallenge(page)
                 || isYandexKaleidoscopeChallenge(page)
                 || kaleidoscopeSolver.hasCapturedPuzzleTask(page);
+        log.info("SmartCaptcha/YouDo/2Captcha: после token pending={} advanced={} kaleidoscope={} networkTask={}",
+                isSmartCaptchaPending(page),
+                isYandexAdvancedChallenge(page),
+                isYandexKaleidoscopeChallenge(page),
+                kaleidoscopeSolver.hasCapturedPuzzleTask(page));
         if (advanced || isSmartCaptchaPending(page)) {
             if (!ok && yandexAudioEnabled) {
                 log.info("SmartCaptcha/YouDo/2Captcha: token не снял challenge — audio");
                 ok = yandexAudioSolver.solve(page);
+                log.info("SmartCaptcha/YouDo/2Captcha: AudioTask → {}", ok ? "ok" : "не снято");
                 if (ok && isSmartTokenPresentOnPage(page)) {
                     dismissSmartCaptchaOverlay(page);
                 }
@@ -1218,7 +1229,10 @@ public class CaptchaService {
             if (!ok && yandexPazlEnabled && shouldUsePazlCaptcha(page)) {
                 log.info("SmartCaptcha/YouDo/2Captcha: PazlCaptchaTask");
                 ok = kaleidoscopeSolver.solve(page);
+                log.info("SmartCaptcha/YouDo/2Captcha: PazlCaptchaTask → {}", ok ? "ok" : "не снято");
             }
+        } else {
+            log.info("SmartCaptcha/YouDo/2Captcha: доп. audio/pazl не нужны (advanced=false, pending=false)");
         }
         if (!ok) {
             recordFailure(page, CaptchaFailureCode.YOUDO_KALEIDOSCOPE_FAIL,

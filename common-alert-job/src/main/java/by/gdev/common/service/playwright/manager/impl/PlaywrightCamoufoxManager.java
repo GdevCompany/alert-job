@@ -2,6 +2,7 @@ package by.gdev.common.service.playwright.manager.impl;
 
 import by.gdev.common.model.SiteName;
 import by.gdev.common.service.playwright.manager.BrowserLaunchOptions;
+import by.gdev.common.service.playwright.manager.CamoufoxActiveSessions;
 import by.gdev.common.service.playwright.manager.CamoufoxLauncherClient;
 import by.gdev.common.service.playwright.manager.PlaywrightBrowserManager;
 import com.microsoft.playwright.*;
@@ -17,6 +18,9 @@ public class PlaywrightCamoufoxManager implements PlaywrightBrowserManager {
 
     @Autowired
     private CamoufoxLauncherClient launcherClient;
+
+    @Autowired
+    private CamoufoxActiveSessions activeSessions;
 
     private final ThreadLocal<String> currentKey = new ThreadLocal<>();
 
@@ -34,13 +38,34 @@ public class PlaywrightCamoufoxManager implements PlaywrightBrowserManager {
                 ? options.proxy().getCountry()
                 : "-";
         log.info("[{}] Подключение к Camoufox: {} country={} (key={})", site, result.endpoint(), country, result.key());
-        try {
-            return playwright.firefox().connect(result.endpoint());
-        } catch (Exception e) {
-            launcherClient.release(result.key());
-            currentKey.remove();
-            throw new RuntimeException("Failed to connect to Camoufox", e);
+        Exception last = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                Browser browser = playwright.firefox().connect(result.endpoint());
+                activeSessions.register(result.key());
+                if (attempt > 1) {
+                    log.info("[{}] Camoufox connect OK с попытки {}", site, attempt);
+                }
+                return browser;
+            } catch (Exception e) {
+                last = e;
+                String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                log.warn("[{}] Camoufox connect попытка {}/3 не удалась: {}", site, attempt, msg);
+                if (attempt < 3 && msg.contains("404")) {
+                    try {
+                        Thread.sleep(500L * attempt);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    continue;
+                }
+                break;
+            }
         }
+        launcherClient.release(result.key());
+        currentKey.remove();
+        throw new RuntimeException("Failed to connect to Camoufox", last);
     }
 
     @Override
@@ -75,6 +100,7 @@ public class PlaywrightCamoufoxManager implements PlaywrightBrowserManager {
 
         String key = currentKey.get();
         if (key != null) {
+            activeSessions.unregister(key);
             launcherClient.release(key);
             currentKey.remove();
         }

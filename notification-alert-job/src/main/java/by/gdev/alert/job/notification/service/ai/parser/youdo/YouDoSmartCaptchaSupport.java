@@ -47,7 +47,9 @@ public class YouDoSmartCaptchaSupport {
             return true;
         }
         if (captchaService.smartCaptchaTokenLength(page) > 20) {
-            return false;
+            // После kaleidoscope-токена часто остаётся чекбокс «Я не робот» — не считаем капчу снятой.
+            return captchaService.isCheckboxIframeChallenge(page)
+                    || captchaService.isYandexCheckboxVisible(page);
         }
         return isSmartCaptchaShellInLoginModal(page);
     }
@@ -58,9 +60,10 @@ public class YouDoSmartCaptchaSupport {
             return false;
         }
         int tokenLen = captchaService.smartCaptchaTokenLength(page);
-        // С токеном блокирует только реальный challenge (калейдоскоп / advanced), не «хвост» checkbox-iframe.
         if (tokenLen > 20) {
-            return captchaService.isYandexKaleidoscopeChallenge(page)
+            return captchaService.isCheckboxIframeChallenge(page)
+                    || captchaService.isYandexCheckboxVisible(page)
+                    || captchaService.isYandexKaleidoscopeChallenge(page)
                     || captchaService.isYandexAdvancedUiVisible(page)
                     || captchaService.isSmartCaptchaOverlayVisible(page);
         }
@@ -79,12 +82,12 @@ public class YouDoSmartCaptchaSupport {
 
     /** Видимый чекбокс / advanced в модалке — капча не снята (только пока нет smart-token). */
     private boolean hasVisibleSmartCaptchaUi(Page page) {
-        if (captchaService.smartCaptchaTokenLength(page) > 20) {
-            return false;
-        }
         if (captchaService.isYandexCheckboxVisible(page)
                 || captchaService.isCheckboxIframeChallenge(page)) {
             return true;
+        }
+        if (captchaService.smartCaptchaTokenLength(page) > 20) {
+            return false;
         }
         if (captchaService.isYandexAdvancedUiVisible(page)
                 && captchaService.isYandexKaleidoscopeChallenge(page)) {
@@ -113,7 +116,9 @@ public class YouDoSmartCaptchaSupport {
     private boolean isActiveYouDoCaptchaChallenge(Page page) {
         int tokenLen = captchaService.smartCaptchaTokenLength(page);
         if (tokenLen > 20) {
-            return captchaService.isYandexKaleidoscopeChallenge(page)
+            return captchaService.isCheckboxIframeChallenge(page)
+                    || captchaService.isYandexCheckboxVisible(page)
+                    || captchaService.isYandexKaleidoscopeChallenge(page)
                     || captchaService.isYandexAdvancedUiVisible(page)
                     || captchaService.isSmartCaptchaOverlayVisible(page);
         }
@@ -179,7 +184,10 @@ public class YouDoSmartCaptchaSupport {
             captchaService.revealOffScreenSmartCaptchaHosts(page);
             page.waitForTimeout(500);
 
+            logDetectedCaptchaUi(page, login, attempt, "перед-solve");
             boolean progressed = solveCurrentChallenge(page, login, attempt);
+            log.info("YOUDO SmartCaptcha: solveCurrentChallenge попытка {} → progressed={}, gate={}, stage={}",
+                    attempt, progressed, isLoginCaptchaGate(page), isSmartCaptchaStage(page));
             captchaService.dismissSmartCaptchaOverlay(page);
             page.waitForTimeout(800);
             captchaService.logSmartCaptchaState(page, "youdo-login-attempt-" + attempt + "-after");
@@ -187,6 +195,12 @@ public class YouDoSmartCaptchaSupport {
                     "youdo-login-attempt-" + attempt + "-after user=" + login);
 
             if (!isSmartCaptchaStage(page)) {
+                page.waitForTimeout(1200);
+                if (isLoginCaptchaGate(page)) {
+                    log.info("YOUDO SmartCaptcha: после solve снова gate (чекбокс?), попытка {}, пользователь: {}",
+                            attempt, login);
+                    continue;
+                }
                 captchaService.resumeYandexSmartCaptchaForForm(page);
                 captchaService.dismissSmartCaptchaOverlay(page);
                 log.info("YOUDO SmartCaptcha снята после попытки {}, пользователь: {}", attempt, login);
@@ -204,6 +218,28 @@ public class YouDoSmartCaptchaSupport {
         return gateOpen;
     }
 
+    private void logDetectedCaptchaUi(Page page, String login, int attempt, String phase) {
+        log.info(
+                "YOUDO SmartCaptcha [{}] попытка {} user={}: tokenLen={} loginGate={} smartStage={} | "
+                        + "checkbox={} checkboxIframe={} kaleidoscope={} advancedUi={} overlay={} pending={} "
+                        + "networkTask={} shellInModal={} twoCaptchaFirst={}",
+                phase,
+                attempt,
+                login,
+                captchaService.smartCaptchaTokenLength(page),
+                isLoginCaptchaGate(page),
+                isSmartCaptchaStage(page),
+                captchaService.isYandexCheckboxVisible(page),
+                captchaService.isCheckboxIframeChallenge(page),
+                captchaService.isYandexKaleidoscopeChallenge(page),
+                captchaService.isYandexAdvancedUiVisible(page),
+                captchaService.isSmartCaptchaOverlayVisible(page),
+                captchaService.isSmartCaptchaPending(page),
+                captchaService.hasCapturedPuzzleTask(page),
+                isSmartCaptchaShellInLoginModal(page),
+                youdoTwoCaptchaFirst);
+    }
+
     private boolean solveCurrentChallenge(Page page, String login, int attempt) {
         boolean any = false;
 
@@ -213,19 +249,29 @@ public class YouDoSmartCaptchaSupport {
                 || captchaService.isYandexAdvancedUiVisible(page)
                 || captchaService.hasCapturedPuzzleTask(page);
 
+        log.info(
+                "YOUDO SmartCaptcha → ветвление (попытка {}): checkboxUi={} advancedUi={} shouldAdvanced2Captcha={}",
+                attempt, checkboxUi, advancedUi, shouldSolveAdvancedViaTwoCaptcha(page));
+
         if (youdoTwoCaptchaFirst && captchaService.isTwoCaptchaConfigured()) {
             log.info("YOUDO SmartCaptcha: 2Captcha primary (все типы), попытка {}, пользователь: {}",
                     attempt, login);
-            any |= captchaService.solveYandexForYouDoViaTwoCaptcha(page);
+            boolean twoCaptchaAll = captchaService.solveYandexForYouDoViaTwoCaptcha(page);
+            log.info("YOUDO SmartCaptcha → solveYandexForYouDoViaTwoCaptcha → {}", twoCaptchaAll ? "ok" : "не снято");
+            any |= twoCaptchaAll;
             if (!isSmartCaptchaStage(page)) {
+                log.info("YOUDO SmartCaptcha → после 2Captcha primary smartStage=false, выход");
                 return any;
             }
+            log.info("YOUDO SmartCaptcha → после 2Captcha primary капча ещё на экране, продолжаем");
+        } else if (youdoTwoCaptchaFirst) {
+            log.warn("YOUDO SmartCaptcha: twoCaptchaFirst=true, но 2Captcha не настроен — локальные шаги");
         }
 
         if (checkboxUi && !youdoTwoCaptchaFirst) {
             log.info("YOUDO SmartCaptcha: сначала клик «Я не робот» (checkbox-iframe), попытка {}, пользователь: {}",
                     attempt, login);
-            if (solveCheckbox(page)) {
+            if (solveCheckbox(page, login, attempt, "early-checkbox-click")) {
                 return true;
             }
         }
@@ -233,7 +279,7 @@ public class YouDoSmartCaptchaSupport {
         if (captchaService.smartCaptchaTokenLength(page) > 20 && checkboxUi) {
             log.info("YOUDO SmartCaptcha: токен в DOM, добиваем чекбокс (попытка {}), пользователь: {}",
                     attempt, login);
-            if (solveCheckbox(page)) {
+            if (solveCheckbox(page, login, attempt, "token-plus-checkbox")) {
                 return true;
             }
         }
@@ -241,9 +287,10 @@ public class YouDoSmartCaptchaSupport {
         // Красный «Я не робот» в модалке: сначала чекбокс; task из /check не значит пазл.
         if (checkboxUi && !advancedUi) {
             log.info("YOUDO SmartCaptcha: этап чекбокс (попытка {}), пользователь: {}", attempt, login);
-            any |= solveCheckbox(page);
+            any |= solveCheckbox(page, login, attempt, "checkbox-only");
         }
         if (!isSmartCaptchaStage(page)) {
+            log.info("YOUDO SmartCaptcha → после чекбокса smartStage=false");
             return any;
         }
 
@@ -252,14 +299,18 @@ public class YouDoSmartCaptchaSupport {
                     attempt,
                     captchaService.hasCapturedPuzzleTask(page),
                     captchaService.isYandexKaleidoscopeChallenge(page));
-            any |= captchaService.solveYandexAdvancedViaTwoCaptcha(page);
+            boolean advancedOk = captchaService.solveYandexAdvancedViaTwoCaptcha(page);
+            log.info("YOUDO SmartCaptcha → solveYandexAdvancedViaTwoCaptcha → {}", advancedOk ? "ok" : "не снято");
+            any |= advancedOk;
         }
         if (!isSmartCaptchaStage(page)) {
+            log.info("YOUDO SmartCaptcha → после advanced 2Captcha smartStage=false");
             return any;
         }
 
         if (!advancedUi && checkboxUi) {
-            any |= solveCheckbox(page);
+            log.info("YOUDO SmartCaptcha → повтор чекбокса после advanced (попытка {})", attempt);
+            any |= solveCheckbox(page, login, attempt, "checkbox-after-advanced");
         }
 
         if (!isSmartCaptchaStage(page)) {
@@ -267,52 +318,82 @@ public class YouDoSmartCaptchaSupport {
         }
 
         if (shouldSolveAdvancedViaTwoCaptcha(page)) {
-            any |= captchaService.solveYandexAdvancedViaTwoCaptcha(page);
+            log.info("YOUDO SmartCaptcha → повтор advanced 2Captcha (попытка {})", attempt);
+            boolean retryAdvanced = captchaService.solveYandexAdvancedViaTwoCaptcha(page);
+            log.info("YOUDO SmartCaptcha → повтор solveYandexAdvancedViaTwoCaptcha → {}",
+                    retryAdvanced ? "ok" : "не снято");
+            any |= retryAdvanced;
         } else if (isSmartCaptchaStage(page)) {
             log.info("YOUDO SmartCaptcha: локальный клик виджета (попытка {}), пользователь: {}", attempt, login);
-            any |= captchaService.solveYandexSmartCaptcha(page);
+            boolean localWidget = captchaService.solveYandexSmartCaptcha(page);
+            log.info("YOUDO SmartCaptcha → solveYandexSmartCaptcha (локально) → {}",
+                    localWidget ? "ok" : "не снято");
+            any |= localWidget;
             if (!any && yandexTwoCaptchaFallback && captchaService.isTwoCaptchaConfigured()) {
                 log.info("YOUDO SmartCaptcha: fallback YandexSmartCaptchaTask (попытка {}), пользователь: {}",
                         attempt, login);
-                any |= captchaService.solveYandexSmartCaptchaViaToken(page);
+                boolean tokenFallback = captchaService.solveYandexSmartCaptchaViaToken(page);
+                log.info("YOUDO SmartCaptcha → solveYandexSmartCaptchaViaToken → {}",
+                        tokenFallback ? "ok" : "не снято");
+                any |= tokenFallback;
             }
         }
+        logDetectedCaptchaUi(page, login, attempt, "после-solve");
         return any;
     }
 
-    private boolean solveCheckbox(Page page) {
+    private boolean solveCheckbox(Page page, String login, int attempt, String reason) {
+        log.info("YOUDO SmartCaptcha → checkbox [{}] попытка {} user={}", reason, attempt, login);
         if (captchaService.isYandexKaleidoscopeChallenge(page)
                 && !captchaService.isCheckboxIframeChallenge(page)) {
+            log.info("YOUDO SmartCaptcha → checkbox [{}]: пропуск (калейдоскоп без checkbox-iframe)", reason);
             return false;
         }
         captchaService.clearLastFailure();
         if (youdoTwoCaptchaFirst && captchaService.isTwoCaptchaConfigured()) {
+            log.info("YOUDO SmartCaptcha → checkbox [{}]: 2Captcha для checkbox", reason);
             if (captchaService.solveYandexForYouDoViaTwoCaptcha(page)) {
                 page.waitForTimeout(1200);
                 if (!isSmartCaptchaStage(page) || captchaService.smartCaptchaTokenLength(page) > 20) {
+                    log.info("YOUDO SmartCaptcha → checkbox [{}]: 2Captcha ok, resumeYandexSmartCaptchaForForm",
+                            reason);
                     captchaService.resumeYandexSmartCaptchaForForm(page);
                     return true;
                 }
             }
+            log.info("YOUDO SmartCaptcha → checkbox [{}]: 2Captcha не завершил checkbox", reason);
         }
+        log.info("YOUDO SmartCaptcha → checkbox [{}]: клик в checkbox-iframe", reason);
         if (captchaService.clickCheckboxInSmartCaptchaIframe(page)) {
             page.waitForTimeout(1200);
             if (captchaService.smartCaptchaTokenLength(page) > 20) {
+                log.info("YOUDO SmartCaptcha → checkbox [{}]: клик ok, tokenLen>20, resume формы", reason);
                 captchaService.resumeYandexSmartCaptchaForForm(page);
                 return true;
             }
             if (!isSmartCaptchaStage(page)) {
+                log.info("YOUDO SmartCaptcha → checkbox [{}]: клик ok, smartStage=false", reason);
                 return true;
             }
+            log.info("YOUDO SmartCaptcha → checkbox [{}]: клик выполнен, капча ещё на экране", reason);
+        } else {
+            log.info("YOUDO SmartCaptcha → checkbox [{}]: клик в iframe не удался", reason);
         }
+        log.info("YOUDO SmartCaptcha → checkbox [{}]: solveYandexSmartCaptcha (локально)", reason);
         if (captchaService.solveYandexSmartCaptcha(page)) {
+            log.info("YOUDO SmartCaptcha → checkbox [{}]: локальный виджет ok", reason);
             return true;
         }
         if (yandexTwoCaptchaFallback && captchaService.isTwoCaptchaConfigured()) {
-            return captchaService.solveYandexSmartCaptchaViaToken(page);
+            log.info("YOUDO SmartCaptcha → checkbox [{}]: fallback token 2Captcha", reason);
+            boolean tokenOk = captchaService.solveYandexSmartCaptchaViaToken(page);
+            log.info("YOUDO SmartCaptcha → checkbox [{}]: solveYandexSmartCaptchaViaToken → {}",
+                    reason, tokenOk ? "ok" : "не снято");
+            return tokenOk;
         }
         captchaService.recordSmartCaptchaFailure(page, CaptchaFailureCode.YOUDO_KALEIDOSCOPE_FAIL,
                 "YouDo SmartCaptcha: не пройден чекбокс", "youdo-checkbox");
+        log.warn("YOUDO SmartCaptcha → checkbox [{}]: все способы исчерпаны", reason);
         return false;
     }
 

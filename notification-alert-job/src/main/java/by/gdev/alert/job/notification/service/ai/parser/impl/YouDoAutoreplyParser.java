@@ -303,13 +303,15 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     private StepResult<Void> runYouDoLoginStageLoop(Page page, DecryptedCredential creds,
                                                     boolean allowEmailForm, boolean otpWaitArmed) {
         int captchaHandled = 0;
-        int postCaptchaNextClicks = 0;
+        int[] postCaptchaNextClicks = {0};
         for (int i = 1; i <= YOUDO_LOGIN_STAGE_MAX_ITERATIONS; i++) {
             YouDoLoginStage stage = detectYouDoLoginStage(page);
             // Как на FL.ru: капча может всплыть на любом шаге — приоритет над формой/UNKNOWN.
             if (stage != YouDoLoginStage.SMART_CAPTCHA
                     && stage != YouDoLoginStage.LOGGED_IN
                     && smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                log.info("АВТООТВЕТ: {} -> detectStage={} но loginCaptchaGate=true → SMART_CAPTCHA, пользователь: {}",
+                        getSiteName(), stage, creds.login());
                 stage = YouDoLoginStage.SMART_CAPTCHA;
             }
             log.info("АВТООТВЕТ: {} -> этап входа {}/{}: {} url={}, пользователь: {}",
@@ -322,18 +324,29 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                         return failYouDoCaptcha(page, creds.login(),
                                 "YouDo SmartCaptcha: слишком много повторов капчи");
                     }
+                    log.info("АВТООТВЕТ: {} -> вызываем passLoginSmartCaptcha ({}/5), otpWaitArmed={}, пользователь: {}",
+                            getSiteName(), captchaHandled, otpWaitArmed, creds.login());
                     if (!smartCaptchaSupport.passLoginSmartCaptcha(page, creds.login())) {
                         return failYouDoCaptcha(page, creds.login(),
                                 "YouDo SmartCaptcha не пройдена (чекбокс / калейдоскоп)");
                     }
+                    log.info("АВТООТВЕТ: {} -> капча пройдена, resumeYandexSmartCaptchaForForm + dismiss overlay, пользователь: {}",
+                            getSiteName(), creds.login());
                     captchaService.resumeYandexSmartCaptchaForForm(page);
                     captchaService.dismissSmartCaptchaOverlay(page);
                     page.waitForTimeout(400);
                     if (otpWaitArmed) {
+                        log.info("АВТООТВЕТ: {} -> otpWaitArmed: tryResumeYouDoEmailSubmitAfterCaptcha, пользователь: {}",
+                                getSiteName(), creds.login());
                         tryResumeYouDoEmailSubmitAfterCaptcha(page);
                         StepResult<Void> stuck = handlePostCaptchaEmailSubmit(page, creds, postCaptchaNextClicks);
                         if (stuck != null) {
                             return stuck;
+                        }
+                        if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                            log.info("АВТООТВЕТ: {} -> после капчи снова loginCaptchaGate — ещё один шаг капчи, пользователь: {}",
+                                    getSiteName(), creds.login());
+                            continue;
                         }
                         if (isOtpFieldVisible(page)) {
                             return null;
@@ -381,21 +394,27 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                             }
                             continue;
                         }
-                        if (postCaptchaNextClicks < YOUDO_POST_CAPTCHA_NEXT_MAX
+                        if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                            continue;
+                        }
+                        if (postCaptchaNextClicks[0] < YOUDO_POST_CAPTCHA_NEXT_MAX
                                 && hasYouDoSmartTokenForSubmit(page)
                                 && isYouDoNextButtonClickable(page)) {
-                            postCaptchaNextClicks++;
+                            postCaptchaNextClicks[0]++;
                             log.info("АВТООТВЕТ: {} -> после капчи одна отправка «Далее» ({}/{}), пользователь: {}",
-                                    getSiteName(), postCaptchaNextClicks, YOUDO_POST_CAPTCHA_NEXT_MAX, creds.login());
+                                    getSiteName(), postCaptchaNextClicks[0], YOUDO_POST_CAPTCHA_NEXT_MAX, creds.login());
                             if (clickYouDoNextButton(page)) {
                                 waitAfterYouDoNextClick(page);
                                 waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
                             }
                             continue;
                         }
-                        if (postCaptchaNextClicks >= YOUDO_POST_CAPTCHA_NEXT_MAX
+                        if (postCaptchaNextClicks[0] >= YOUDO_POST_CAPTCHA_NEXT_MAX
                                 && isEmailFieldVisible(page)
                                 && !isOtpFieldVisible(page)) {
+                            if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                                continue;
+                            }
                             return failYouDoEmailSubmitStuck(page, creds.login());
                         }
                         waitForYouDoLoginProgress(page, 8_000);
@@ -453,8 +472,25 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
      * После капчи: не кликать «Далее», пока крутится спиннер; дождаться OTP или одной повторной отправки.
      */
     private StepResult<Void> handlePostCaptchaEmailSubmit(Page page, DecryptedCredential creds,
-                                                          int postCaptchaNextClicks) {
+                                                          int[] postCaptchaNextClicks) {
+        log.info("АВТООТВЕТ: {} -> handlePostCaptchaEmailSubmit: otp={} loggedIn={} loading={} tokenSubmit={} "
+                        + "nextClickable={} postCaptchaClicks={}/{}, пользователь: {}",
+                getSiteName(),
+                isOtpFieldVisible(page),
+                isYouDoLoggedIn(page),
+                isYouDoEmailSubmitLoading(page),
+                hasYouDoSmartTokenForSubmit(page),
+                isYouDoNextButtonClickable(page),
+                postCaptchaNextClicks[0],
+                YOUDO_POST_CAPTCHA_NEXT_MAX,
+                creds.login());
         if (isOtpFieldVisible(page) || isYouDoLoggedIn(page)) {
+            log.info("АВТООТВЕТ: {} -> postCaptcha: уже OTP или logged-in, выход", getSiteName());
+            return null;
+        }
+        if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+            log.info("АВТООТВЕТ: {} -> postCaptcha: loginCaptchaGate — ждём повторного прохода капчи, пользователь: {}",
+                    getSiteName(), creds.login());
             return null;
         }
         if (isYouDoEmailSubmitLoading(page)) {
@@ -484,12 +520,25 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             }
             return null;
         }
-        if (postCaptchaNextClicks >= YOUDO_POST_CAPTCHA_NEXT_MAX) {
+        if (postCaptchaNextClicks[0] >= YOUDO_POST_CAPTCHA_NEXT_MAX) {
+            log.info("АВТООТВЕТ: {} -> postCaptcha: лимит повторных «Далее» исчерпан", getSiteName());
             return null;
         }
         if (!hasYouDoSmartTokenForSubmit(page) || !isYouDoNextButtonClickable(page)) {
+            log.info("АВТООТВЕТ: {} -> postCaptcha: ждём прогресс (tokenSubmit={} nextClickable={})",
+                    getSiteName(), hasYouDoSmartTokenForSubmit(page), isYouDoNextButtonClickable(page));
             waitForYouDoLoginProgress(page, 12_000);
             return null;
+        }
+        postCaptchaNextClicks[0]++;
+        log.info("АВТООТВЕТ: {} -> postCaptcha: «Далее» с токеном ({}/{}), пользователь: {}",
+                getSiteName(), postCaptchaNextClicks[0], YOUDO_POST_CAPTCHA_NEXT_MAX, creds.login());
+        if (clickYouDoNextButton(page)) {
+            waitAfterYouDoNextClick(page);
+            waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
+        } else {
+            forceClickYouDoNextAfterCaptcha(page);
+            waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
         }
         return null;
     }
