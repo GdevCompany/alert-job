@@ -42,6 +42,7 @@ public final class AutoreplyFailurePolicy {
                 case FLRU_LOGIN_YANDEX_CHECKBOX,
                      CAPTCHA_GENERIC,
                      CAPTCHA_EXCEPTION -> AutoreplyFailureAction.RETRY_SAME;
+                default -> AutoreplyFailureAction.ABORT;
             };
         } catch (IllegalArgumentException ignored) {
             // не код капчи
