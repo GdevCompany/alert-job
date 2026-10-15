@@ -5,7 +5,10 @@ import by.gdev.common.service.playwright.manager.BrowserLaunchOptions;
 import by.gdev.common.service.playwright.manager.CamoufoxActiveSessions;
 import by.gdev.common.service.playwright.manager.CamoufoxLauncherClient;
 import by.gdev.common.service.playwright.manager.PlaywrightBrowserManager;
-import com.microsoft.playwright.*;
+import com.microsoft.playwright.Browser;
+import com.microsoft.playwright.BrowserContext;
+import com.microsoft.playwright.Playwright;
+import com.microsoft.playwright.Page;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -86,7 +89,9 @@ public class PlaywrightCamoufoxManager implements PlaywrightBrowserManager {
         // storageState игнорируется: на connect восстановление через restoreCookies/restoreOrigins.
         // Контекст всегда новый: инстанс Camoufox может быть общим, переиспользование чужого
         // контекста привело бы к утечке cookies между пользователями.
-        return browser.newContext();
+        return browser.newContext(new Browser.NewContextOptions()
+                .setViewportSize(1366, 900)
+                .setDeviceScaleFactor(1.0));
     }
 
     @Override

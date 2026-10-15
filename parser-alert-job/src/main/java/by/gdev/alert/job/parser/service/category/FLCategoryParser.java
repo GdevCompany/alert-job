@@ -4,7 +4,7 @@ import by.gdev.alert.job.parser.domain.db.SiteSourceJob;
 import by.gdev.common.model.SiteName;
 import by.gdev.alert.job.parser.service.playwright.PlaywrightCategoryParser;
 import by.gdev.common.model.proxy.ProxyCredentials;
-import by.gdev.common.service.playwright.flru.FlRuPlaywrightGuards;
+import by.gdev.alert.job.parser.service.order.FlRuPlaywrightGuards;
 import com.microsoft.playwright.*;
 import com.microsoft.playwright.options.WaitUntilState;
 import lombok.RequiredArgsConstructor;

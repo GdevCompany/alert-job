@@ -60,6 +60,13 @@ public class TwoCaptchaClient {
     @Value("${captcha.two-captcha.reports.enabled:true}")
     private boolean reportsEnabled;
 
+    /**
+     * Передавать в 2Captcha тот же HTTP-прокси, что у Playwright ({@code YandexSmartCaptchaTask}),
+     * чтобы IP решения совпадал с сессией браузера (важно для YouDo).
+     */
+    @Value("${captcha.yandex.two-captcha-use-browser-proxy:true}")
+    private boolean yandexUseBrowserProxy;
+
     @PostConstruct
     void logConfiguration() {
         if (!enabled) {
@@ -126,26 +133,47 @@ public class TwoCaptchaClient {
             log.warn("2Captcha: sitekey не найден для {}", pageUrl);
             return Optional.empty();
         }
-        String kind = "Yandex SmartCaptcha (proxyless)";
-        return solveWithRetries(pageUrl, kind, () -> {
-            long taskId = createYandexTask(pageUrl, siteKey, userAgent, cookies, null);
-            return pollTaskResult(taskId, kind);
-        });
+        return solveYandexSmartCaptcha(pageUrl, siteKey, userAgent, cookies, null);
     }
 
     /**
      * Решает Yandex SmartCaptcha через 2Captcha.
-     * Всегда {@code YandexSmartCaptchaTaskProxyless}: прокси только у Playwright, в API не передаём.
-     *
-     * @param proxy игнорируется (оставлен для совместимости вызовов)
+     * При {@code captcha.yandex.two-captcha-use-browser-proxy=true} и непустом {@code proxy}
+     * создаётся {@code YandexSmartCaptchaTask} с тем же HTTP-прокси, что у браузера.
      */
     public Optional<String> solveYandexSmartCaptcha(String pageUrl, String siteKey, String userAgent, String cookies,
                                                     ProxyCredentials proxy) {
-        if (proxy != null && proxy.getHost() != null && !proxy.getHost().isBlank()) {
-            log.debug("2Captcha: прокси браузера {}:{} в API не передаём (proxyless)",
-                    proxy.getHost(), proxy.getPort());
+        if (!isConfigured()) {
+            log.warn("2Captcha: запрос пропущен — enabled={}, clientKey={}",
+                    enabled, maskClientKey(effectiveApiKey()));
+            return Optional.empty();
         }
-        return solveYandexSmartCaptcha(pageUrl, siteKey, userAgent, cookies);
+        if (siteKey == null || siteKey.isBlank()) {
+            log.warn("2Captcha: sitekey не найден для {}", pageUrl);
+            return Optional.empty();
+        }
+        ProxyCredentials effectiveProxy = resolveYandexProxy(proxy);
+        String kind = effectiveProxy != null
+                ? "Yandex SmartCaptcha (browser proxy)"
+                : "Yandex SmartCaptcha (proxyless)";
+        if (effectiveProxy != null) {
+            log.info("2Captcha: Yandex SmartCaptcha через прокси браузера {}:{} (type=YandexSmartCaptchaTask)",
+                    effectiveProxy.getHost(), effectiveProxy.getPort());
+        }
+        return solveWithRetries(pageUrl, kind, () -> {
+            long taskId = createYandexTask(pageUrl, siteKey, userAgent, cookies, effectiveProxy);
+            return pollTaskResult(taskId, kind);
+        });
+    }
+
+    private ProxyCredentials resolveYandexProxy(ProxyCredentials proxy) {
+        if (!yandexUseBrowserProxy || proxy == null) {
+            return null;
+        }
+        if (proxy.getHost() == null || proxy.getHost().isBlank() || proxy.getPort() <= 0) {
+            return null;
+        }
+        return proxy;
     }
 
     /**
@@ -514,7 +542,18 @@ public class TwoCaptchaClient {
     private long createYandexTask(String pageUrl, String siteKey, String userAgent, String cookies,
                                   ProxyCredentials proxy) throws Exception {
         Map<String, Object> task = new LinkedHashMap<>();
-        task.put("type", "YandexSmartCaptchaTaskProxyless");
+        if (proxy != null && proxy.getHost() != null && !proxy.getHost().isBlank() && proxy.getPort() > 0) {
+            task.put("type", "YandexSmartCaptchaTask");
+            task.put("proxyType", "http");
+            task.put("proxyAddress", proxy.getHost());
+            task.put("proxyPort", proxy.getPort());
+            if (proxy.getUsername() != null && !proxy.getUsername().isBlank()) {
+                task.put("proxyLogin", proxy.getUsername());
+                task.put("proxyPassword", proxy.getPassword() != null ? proxy.getPassword() : "");
+            }
+        } else {
+            task.put("type", "YandexSmartCaptchaTaskProxyless");
+        }
         task.put("websiteURL", pageUrl);
         task.put("websiteKey", siteKey);
         if (userAgent != null && !userAgent.isBlank()) {

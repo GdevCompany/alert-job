@@ -1,12 +1,12 @@
-package by.gdev.alert.job.notification.service.ai.parser.impl;
+package by.gdev.alert.job.notification.service.ai.parser.impl.flru;
 
 import by.gdev.alert.job.notification.model.AutoreplyMode;
 import by.gdev.alert.job.notification.model.dto.AiNotificationPayload;
 import by.gdev.alert.job.notification.model.dto.DecryptedCredential;
-import by.gdev.alert.job.notification.service.ai.flru.FlRuValidateCaptchaSupport;
 import by.gdev.alert.job.notification.service.ai.metrics.errors.AutoreplyErrorTypes;
 import by.gdev.alert.job.notification.service.ai.otp.OtpService;
 import by.gdev.alert.job.notification.service.ai.parser.AutoreplyPlaywrightParser;
+import by.gdev.alert.job.notification.service.ai.parser.impl.AutoreplyParser;
 import by.gdev.alert.job.notification.service.ai.proxy.AssignedProxyService;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
@@ -14,7 +14,6 @@ import by.gdev.alert.job.notification.service.ai.recovery.AutoreplyFailureAction
 import by.gdev.common.model.SiteName;
 import by.gdev.common.service.playwright.captcha.failure.CaptchaFailureInfo;
 import by.gdev.common.service.playwright.captcha.CaptchaService;
-import by.gdev.common.service.playwright.flru.FlRuPlaywrightGuards;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.options.LoadState;
@@ -176,7 +175,7 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
     }
 
     @Override
-    void safeNavigate(Page page, String url) {
+    protected void safeNavigate(Page page, String url) {
         super.safeNavigate(page, url);
         StepResult<Void> maintenance = failIfSiteMaintenance(page, "navigate");
         if (maintenance != null) {

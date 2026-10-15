@@ -203,6 +203,7 @@ public class ProxyCheckerService {
      * @param verbose только первый прогон при старте — WARN/DEBUG по каждому прокси; иначе без построчного вывода
      */
     public ProxyCheckSummary checkProxies(List<ProxyCredentials> proxies, boolean countryFilter, boolean verbose) {
+        long checkStartedAtMs = System.currentTimeMillis();
         int total = proxies.size();
         int working = 0;
         int notWorking = 0;
@@ -233,10 +234,35 @@ public class ProxyCheckerService {
             }
         }
         if (verbose) {
-            log.info("Проверка списка прокси завершена. Статистика: РАБОЧИЕ = {}, НЕ РАБОЧИЕ = {}",
-                    working, notWorking);
+            long elapsedMs = System.currentTimeMillis() - checkStartedAtMs;
+            log.info("Проверка списка прокси завершена за {} (всего {}). Статистика: РАБОЧИЕ = {}, НЕ РАБОЧИЕ = {}",
+                    formatCheckDuration(elapsedMs), total, working, notWorking);
         }
         markCheckEnded();
         return new ProxyCheckSummary(total, working, notWorking);
+    }
+
+    private static String formatCheckDuration(long elapsedMs) {
+        if (elapsedMs < 0) {
+            elapsedMs = 0;
+        }
+        long totalSec = elapsedMs / 1000;
+        if (totalSec < 60) {
+            return elapsedMs + " мс";
+        }
+        long min = totalSec / 60;
+        long sec = totalSec % 60;
+        if (min < 60) {
+            return sec > 0 ? min + " мин " + sec + " сек" : min + " мин";
+        }
+        long hours = min / 60;
+        min = min % 60;
+        if (min > 0 && sec > 0) {
+            return hours + " ч " + min + " мин " + sec + " сек";
+        }
+        if (min > 0) {
+            return hours + " ч " + min + " мин";
+        }
+        return hours + " ч " + sec + " сек";
     }
 }

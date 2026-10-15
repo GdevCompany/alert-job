@@ -452,7 +452,7 @@ public abstract class AutoreplyParser {
         page.waitForTimeout(pause);
     }
 
-    void safeNavigate(Page page, String url) {
+    protected void safeNavigate(Page page, String url) {
         for (int i = 1; i <= 5; i++) {
             try {
                 page.navigate(url, new Page.NavigateOptions().setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
@@ -475,7 +475,7 @@ public abstract class AutoreplyParser {
         }
     }*/
 
-    boolean waitOrFail(Page page, String selector, String step) {
+    protected boolean waitOrFail(Page page, String selector, String step) {
         long totalMs = timeouts.getElementWaitMs();
         long pollMs  = timeouts.getElementPollMs();
         long deadline = System.currentTimeMillis() + totalMs;
@@ -502,7 +502,7 @@ public abstract class AutoreplyParser {
         return false;
     }
 
-    boolean clickOrFail(Page page, String selector, String step) {
+    protected boolean clickOrFail(Page page, String selector, String step) {
         if (!waitOrFail(page, selector, step)) return false;
         try {
             getCurrentManager().humanClick(page, selector);

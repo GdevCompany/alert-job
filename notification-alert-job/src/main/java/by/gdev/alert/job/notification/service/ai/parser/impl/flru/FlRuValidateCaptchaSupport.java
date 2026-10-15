@@ -1,4 +1,4 @@
-package by.gdev.alert.job.notification.service.ai.flru;
+package by.gdev.alert.job.notification.service.ai.parser.impl.flru;
 
 import by.gdev.common.service.playwright.captcha.CaptchaService;
 import com.microsoft.playwright.Locator;
@@ -27,6 +27,7 @@ public class FlRuValidateCaptchaSupport {
     };
 
     private final CaptchaService captchaService;
+    private final FlRuValidateCaptchaSolver validateCaptchaSolver;
 
     public boolean isValidateCaptchaPage(Page page) {
         if (page == null) {
@@ -60,9 +61,9 @@ public class FlRuValidateCaptchaSupport {
                 return true;
             }
             log.info("FLRU validate-captcha / IP-блок (попытка {}), пользователь: {}", attempt, login);
-            captchaService.logValidateCaptchaState(page, "gate-attempt-" + attempt + "-before");
-            if (!captchaService.solveFlRuValidateCaptcha(page)) {
-                captchaService.logValidateCaptchaState(page, "gate-attempt-" + attempt + "-failed");
+            validateCaptchaSolver.logValidateCaptchaState(page, "gate-attempt-" + attempt + "-before");
+            if (!validateCaptchaSolver.solveFlRuValidateCaptcha(page)) {
+                validateCaptchaSolver.logValidateCaptchaState(page, "gate-attempt-" + attempt + "-failed");
                 return false;
             }
             captchaService.dismissSmartCaptchaOverlay(page);
@@ -72,7 +73,7 @@ public class FlRuValidateCaptchaSupport {
             }
             waitUntilLeftValidateCaptcha(page, 15_000);
             page.waitForTimeout(800);
-            captchaService.logValidateCaptchaState(page, "gate-attempt-" + attempt + "-after-wait");
+            validateCaptchaSolver.logValidateCaptchaState(page, "gate-attempt-" + attempt + "-after-wait");
             if (!isValidateCaptchaPage(page)) {
                 log.info("FLRU validate-captcha снята после попытки {}, url={}, пользователь: {}",
                         attempt, page.url(), login);
@@ -80,7 +81,7 @@ public class FlRuValidateCaptchaSupport {
             }
         }
         if (isValidateCaptchaPage(page)) {
-            captchaService.recordFailureForValidateStuck(page);
+            validateCaptchaSolver.recordFailureForValidateStuck(page);
             return false;
         }
         return true;

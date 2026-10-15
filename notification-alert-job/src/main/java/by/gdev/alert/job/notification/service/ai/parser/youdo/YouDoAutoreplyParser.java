@@ -1,4 +1,4 @@
-package by.gdev.alert.job.notification.service.ai.parser.impl;
+package by.gdev.alert.job.notification.service.ai.parser.youdo;
 
 import by.gdev.alert.job.notification.model.AutoreplyMode;
 import by.gdev.alert.job.notification.model.dto.AiNotificationPayload;
@@ -6,17 +6,16 @@ import by.gdev.alert.job.notification.model.dto.DecryptedCredential;
 import by.gdev.alert.job.notification.service.ai.metrics.errors.AutoreplyErrorTypes;
 import by.gdev.alert.job.notification.service.ai.parser.AutoreplyPlaywrightParser;
 import by.gdev.alert.job.notification.service.ai.otp.OtpService;
-import by.gdev.alert.job.notification.service.ai.parser.YoudoTariffChecker;
-import by.gdev.alert.job.notification.service.ai.parser.youdo.YouDoLoginCaptcha;
-import by.gdev.alert.job.notification.service.ai.parser.youdo.YouDoSmartCaptchaSupport;
+import by.gdev.alert.job.notification.service.ai.parser.impl.AutoreplyParser;
+import by.gdev.alert.job.notification.service.ai.parser.impl.flru.FlRuAutoreplyParser;
 import by.gdev.alert.job.notification.service.ai.proxy.AssignedProxyService;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
 import by.gdev.common.model.SiteName;
 import by.gdev.common.service.playwright.captcha.failure.CaptchaFailureInfo;
+import by.gdev.common.service.playwright.human.HumanInput;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
-import com.microsoft.playwright.options.AriaRole;
 import com.microsoft.playwright.options.LoadState;
 import com.microsoft.playwright.options.WaitForSelectorState;
 import lombok.extern.slf4j.Slf4j;
@@ -46,6 +45,8 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
 
     private static final int LOGIN_MODAL_WAIT_MS = 12_000;
     private static final int LOGIN_CLICK_RETRY_MS = 28_000;
+    /** Cookie-баннер YouDo часто монтируется с задержкой после NETWORKIDLE (особенно Camoufox/Linux). */
+    private static final int COOKIE_BANNER_SETTLE_MS = 3_500;
 
     private static final String[] EMAIL_ERROR_SELECTORS = {
             "text=Неправильный адрес электронной почты",
@@ -85,6 +86,10 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
 
     private final YouDoSmartCaptchaSupport smartCaptchaSupport;
 
+    private final YouDoBrowserGuards browserGuards;
+
+    private final YouDoModalLayoutFix modalLayoutFix;
+
     @Value("${parser.autoreply.headless.youdo.com:true}")
     private void setHeadless(boolean headless) {
         this.headless = headless;
@@ -107,12 +112,16 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                                 OtpService otpService,
                                 YoudoTariffChecker youdoTariffChecker,
                                 YouDoLoginCaptcha youDoLoginCaptcha,
-                                YouDoSmartCaptchaSupport smartCaptchaSupport) {
+                                YouDoSmartCaptchaSupport smartCaptchaSupport,
+                                YouDoBrowserGuards browserGuards,
+                                YouDoModalLayoutFix modalLayoutFix) {
         super(assignedProxyService);
         this.otpService = otpService;
         this.youdoTariffChecker = youdoTariffChecker;
         this.youDoLoginCaptcha = youDoLoginCaptcha;
         this.smartCaptchaSupport = smartCaptchaSupport;
+        this.browserGuards = browserGuards;
+        this.modalLayoutFix = modalLayoutFix;
     }
 
     @Override
@@ -128,6 +137,8 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     @Override
     protected StepResult<Void> login(Page page, AiNotificationPayload payload, DecryptedCredential creds, AutoreplyMode mode) {
         log.info("АВТООТВЕТ: {} -> НАЧАЛО ЛОГИНА, пользователь: {}", getSiteName(), creds.login());
+        browserGuards.installForLogin(page);
+        YouDoLoginFsmState.log(log, YouDoLoginFsmState.NAVIGATE_HOME, creds.login(), null);
 
         // Открыть главную страницу
         try {
@@ -146,8 +157,12 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             log.debug("АВТООТВЕТ: {} -> NETWORKIDLE не достигнут, продолжаем, пользователь: {}", getSiteName(), creds.login());
         }
 
-        dismissCookieBanner(page);
+        humanWarmupYouDo(page);
 
+        YouDoLoginFsmState.log(log, YouDoLoginFsmState.DISMISS_COOKIES, creds.login(), null);
+        prepareYouDoPageForLogin(page);
+
+        YouDoLoginFsmState.log(log, YouDoLoginFsmState.OPEN_LOGIN_MODAL, creds.login(), null);
         if (!clickHeaderLoginUntilModal(page, creds.login())) {
             report(Level.WARN, log,
                     String.format("АВТООТВЕТ: %s -> НЕ ОТКРЫЛАСЬ МОДАЛКА ВХОДА, пользователь: %s",
@@ -156,7 +171,9 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Не открылась модалка входа YouDo", captureScreenshot(page));
         }
         log.info("АВТООТВЕТ: {} -> модалка входа открыта, пользователь: {}", getSiteName(), creds.login());
+        modalLayoutFix.apply(page);
 
+        YouDoLoginFsmState.log(log, YouDoLoginFsmState.CHOOSE_EMAIL, creds.login(), null);
         if (!openEmailLoginStep(page, creds.login())) {
             report(Level.WARN, log,
                     "АВТООТВЕТ: " + getSiteName() + " -> НЕ УДАЛОСЬ ПЕРЕЙТИ К ВХОДУ ПО EMAIL, пользователь: " + creds.login(),
@@ -173,9 +190,10 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Поле email не найдено", captureScreenshot(page));
         }
 
+        YouDoLoginFsmState.log(log, YouDoLoginFsmState.FILL_EMAIL, creds.login(), null);
         // Заполнение email
         try {
-            page.fill("input[name='login']", creds.login());
+            humanTypeField(page, "input[name='login']", creds.login());
             log.info("АВТООТВЕТ: {} -> email заполнен: {}", getSiteName(), creds.login());
         } catch (Exception e) {
             report(Level.WARN, log,
@@ -204,6 +222,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         }
 
         otpService.beginOtpWait(SiteName.YOUDO.name(), creds.login());
+        YouDoLoginFsmState.log(log, YouDoLoginFsmState.SUBMIT_EMAIL, creds.login(), "нажимаем «Далее»");
         log.info("АВТООТВЕТ: {} -> OTP wait начат, нажимаем «Далее», пользователь: {}", getSiteName(), creds.login());
 
         if (!clickOrFail(page, "button:has-text('Далее')", "Кнопка 'Далее'")) {
@@ -215,6 +234,12 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         log.info("АВТООТВЕТ: {} -> кнопка 'Далее' нажата, пользователь: {}", getSiteName(), creds.login());
 
         waitAfterYouDoNextClick(page);
+        modalLayoutFix.apply(page);
+        browserGuards.clickContinueEditingIfPresent(page);
+        StepResult<Void> captchaAfterNext = resolveCaptchaBlockingStep(page, creds);
+        if (captchaAfterNext != null) {
+            return captchaAfterNext;
+        }
 
         StepResult<Void> gates = runYouDoLoginStageLoop(page, creds, false, true);
         if (gates != null && gates.failed()) {
@@ -255,7 +280,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         }
 
         try {
-            page.fill("input[name='code']", otp);
+            humanTypeField(page, "input[name='code']", otp);
             log.info("АВТООТВЕТ: {} -> OTP заполнен для пользователя: {}", getSiteName(), creds.login());
         } catch (Exception e) {
             report(Level.WARN, log,
@@ -305,15 +330,24 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         int captchaHandled = 0;
         int[] postCaptchaNextClicks = {0};
         for (int i = 1; i <= YOUDO_LOGIN_STAGE_MAX_ITERATIONS; i++) {
+            if (page.isClosed()) {
+                YouDoLoginFsmState.log(log, YouDoLoginFsmState.ABORT, creds.login(), "страница закрыта");
+                return StepResult.fail(StepType.SEND_AUTOREPLY, "Браузер закрыт во время входа YouDo",
+                        captureScreenshot(page));
+            }
+            browserGuards.clickContinueEditingIfPresent(page);
             YouDoLoginStage stage = detectYouDoLoginStage(page);
-            // Как на FL.ru: капча может всплыть на любом шаге — приоритет над формой/UNKNOWN.
+            // Капча может всплыть на любом шаге — приоритет над формой/UNKNOWN.
             if (stage != YouDoLoginStage.SMART_CAPTCHA
                     && stage != YouDoLoginStage.LOGGED_IN
-                    && smartCaptchaSupport.isLoginCaptchaGate(page)) {
-                log.info("АВТООТВЕТ: {} -> detectStage={} но loginCaptchaGate=true → SMART_CAPTCHA, пользователь: {}",
-                        getSiteName(), stage, creds.login());
+                    && (smartCaptchaSupport.isLoginCaptchaGate(page)
+                    || smartCaptchaSupport.isSmartCaptchaShellPresent(page))) {
+                YouDoLoginFsmState.log(log, YouDoLoginFsmState.CAPTCHA_GUARD, creds.login(),
+                        "перехват: было " + stage + " → SMART_CAPTCHA, kind="
+                                + smartCaptchaSupport.detectCaptchaKind(page));
                 stage = YouDoLoginStage.SMART_CAPTCHA;
             }
+            logFsmStage(stage, creds.login(), i);
             log.info("АВТООТВЕТ: {} -> этап входа {}/{}: {} url={}, пользователь: {}",
                     getSiteName(), i, YOUDO_LOGIN_STAGE_MAX_ITERATIONS, stage, page.url(), creds.login());
 
@@ -432,12 +466,18 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                 }
                 case UNKNOWN -> {
                     page.waitForTimeout(700);
-                    if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+                    captchaService.revealYouDoLoginCaptchaIframe(page);
+                    if (smartCaptchaSupport.isLoginCaptchaGate(page)
+                            || smartCaptchaSupport.isSmartCaptchaShellPresent(page)) {
+                        YouDoLoginFsmState.log(log, YouDoLoginFsmState.CAPTCHA_GUARD, creds.login(),
+                                "UNKNOWN → shell/gate, ждём 2Captcha");
                         captchaService.waitForYandexSmartCaptchaWidget(page, 12_000);
-                        captchaService.revealOffScreenSmartCaptchaHosts(page);
                         continue;
                     }
-                    if (otpWaitArmed && !isEmailFieldVisible(page) && !isOtpFieldVisible(page)
+                    if (otpWaitArmed && isEmailFieldVisible(page)) {
+                        continue;
+                    }
+                    if (!otpWaitArmed && !isEmailFieldVisible(page) && !isOtpFieldVisible(page)
                             && shouldRestoreYouDoEmailFormAfterCaptcha(page)) {
                         restoreYouDoEmailFormAfterCaptcha(page, creds);
                     }
@@ -535,10 +575,15 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                 getSiteName(), postCaptchaNextClicks[0], YOUDO_POST_CAPTCHA_NEXT_MAX, creds.login());
         if (clickYouDoNextButton(page)) {
             waitAfterYouDoNextClick(page);
+            triggerYouDoEmailFormSubmit(page);
             waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
         } else {
             forceClickYouDoNextAfterCaptcha(page);
             waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
+        }
+        if (!isOtpFieldVisible(page) && isEmailFieldVisible(page) && hasYouDoSmartTokenForSubmit(page)) {
+            triggerYouDoEmailFormSubmit(page);
+            waitForYouDoLoginProgress(page, 15_000);
         }
         return null;
     }
@@ -579,6 +624,37 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         }
         if (hasYouDoSmartTokenForSubmit(page)) {
             forceClickYouDoNextAfterCaptcha(page);
+            triggerYouDoEmailFormSubmit(page);
+        }
+    }
+
+    /** React-форма YouDo: после внешнего smart-token иногда нужен requestSubmit / Enter, не только клик. */
+    private void triggerYouDoEmailFormSubmit(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        try {
+            Object ok = page.evaluate(
+                    """
+                            () => {
+                              const login = document.querySelector('input[name="login"]');
+                              if (!login || login.offsetParent === null) return false;
+                              const form = login.closest('form');
+                              if (form && typeof form.requestSubmit === 'function') {
+                                form.requestSubmit();
+                                return true;
+                              }
+                              login.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+                              login.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+                              return true;
+                            }
+                            """);
+            if (Boolean.TRUE.equals(ok)) {
+                log.info("АВТООТВЕТ: {} -> отправка формы email (requestSubmit/Enter)", getSiteName());
+                waitAfterYouDoNextClick(page);
+            }
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> requestSubmit email: {}", getSiteName(), e.getMessage());
         }
     }
 
@@ -609,10 +685,10 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         try {
             Locator next = page.locator("button:has-text('Далее')").first();
             if (next.count() > 0 && next.isVisible()) {
-                getCurrentManager().humanDelay(page);
-                next.click(new Locator.ClickOptions().setForce(true).setTimeout(8_000));
+                clickLocatorForceIfNeeded(page, next);
                 log.info("АВТООТВЕТ: {} -> force-клик «Далее» после капчи", getSiteName());
                 waitAfterYouDoNextClick(page);
+                triggerYouDoEmailFormSubmit(page);
             }
         } catch (Exception e) {
             log.debug("АВТООТВЕТ: {} -> force «Далее» не удался: {}", getSiteName(), e.getMessage());
@@ -625,7 +701,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         }
         if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
             captchaService.waitForYandexSmartCaptchaWidget(page, 15_000);
-            captchaService.revealOffScreenSmartCaptchaHosts(page);
+            captchaService.revealYouDoLoginCaptchaIframe(page);
             page.waitForTimeout(400);
         } else if (hasYouDoSmartTokenForSubmit(page)) {
             page.waitForTimeout(600);
@@ -710,18 +786,57 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
      * Не переоткрываем модалку, если идёт submit, есть smart-token или ещё виден чекбокс капчи.
      */
     private boolean shouldRestoreYouDoEmailFormAfterCaptcha(Page page) {
-        if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+        if (smartCaptchaSupport.isLoginCaptchaGate(page)
+                || smartCaptchaSupport.isSmartCaptchaShellPresent(page)) {
             return false;
         }
         if (hasYouDoSmartTokenForSubmit(page) || isYouDoEmailSubmitLoading(page)) {
             return false;
         }
+        if (isLoginModalOpen(page) || isEmailFieldVisible(page)) {
+            return false;
+        }
         return true;
+    }
+
+    /** Если на экране капча (в т.ч. скрытый shell) — только 2Captcha, без reopen модалки. */
+    private StepResult<Void> resolveCaptchaBlockingStep(Page page, DecryptedCredential creds) {
+        if (!smartCaptchaSupport.isLoginCaptchaGate(page)
+                && !smartCaptchaSupport.isSmartCaptchaShellPresent(page)) {
+            return null;
+        }
+        YouDoSmartCaptchaSupport.CaptchaKind kind = smartCaptchaSupport.detectCaptchaKind(page);
+        YouDoLoginFsmState.log(log, YouDoLoginFsmState.CAPTCHA_GUARD, creds.login(), "resolve kind=" + kind);
+        modalLayoutFix.apply(page);
+        captchaService.revealYouDoLoginCaptchaIframe(page);
+        if (!smartCaptchaSupport.passLoginSmartCaptcha(page, creds.login())) {
+            return failYouDoCaptcha(page, creds.login(), "YouDo SmartCaptcha не пройдена (2Captcha)");
+        }
+        captchaService.resumeYandexSmartCaptchaForForm(page);
+        captchaService.dismissSmartCaptchaOverlay(page);
+        return null;
+    }
+
+    private void logFsmStage(YouDoLoginStage stage, String login, int iteration) {
+        YouDoLoginFsmState fsm = switch (stage) {
+            case SMART_CAPTCHA -> YouDoLoginFsmState.CAPTCHA_GUARD;
+            case EMAIL_FORM -> YouDoLoginFsmState.POST_CAPTCHA_SUBMIT;
+            case OTP_CODE -> YouDoLoginFsmState.WAIT_OTP;
+            case LOGGED_IN -> YouDoLoginFsmState.DONE;
+            case EMAIL_ERROR, UNKNOWN -> YouDoLoginFsmState.CAPTCHA_GUARD;
+        };
+        YouDoLoginFsmState.log(log, fsm, login, "loop=" + iteration + " stage=" + stage);
     }
 
     /** После капчи модалка иногда закрывается — снова открываем email и заполняем. */
     private void restoreYouDoEmailFormAfterCaptcha(Page page, DecryptedCredential creds) {
         if (page == null || page.isClosed() || isEmailFieldVisible(page) || isOtpFieldVisible(page)) {
+            return;
+        }
+        if (smartCaptchaSupport.isSmartCaptchaShellPresent(page)
+                || smartCaptchaSupport.isLoginCaptchaGate(page)) {
+            log.info("АВТООТВЕТ: {} -> восстановление формы пропущено (капча в DOM), пользователь: {}",
+                    getSiteName(), creds.login());
             return;
         }
         log.info("АВТООТВЕТ: {} -> восстановление формы email после капчи, пользователь: {}",
@@ -735,7 +850,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         try {
             String current = page.locator("input[name='login']").first().inputValue();
             if (current == null || current.isBlank() || !current.equals(creds.login())) {
-                page.fill("input[name='login']", creds.login());
+                humanTypeField(page, "input[name='login']", creds.login());
                 log.info("АВТООТВЕТ: {} -> email повторно заполнен: {}", getSiteName(), creds.login());
             }
         } catch (Exception e) {
@@ -758,7 +873,8 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         if (page == null || page.isClosed()) {
             return YouDoLoginStage.UNKNOWN;
         }
-        if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
+        if (smartCaptchaSupport.isLoginCaptchaGate(page)
+                || smartCaptchaSupport.isSmartCaptchaShellPresent(page)) {
             return YouDoLoginStage.SMART_CAPTCHA;
         }
         if (isEmailErrorPresent(page)) {
@@ -848,6 +964,42 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         return null;
     }
 
+    /** Дождаться позднего cookie-баннера и снять его до клика «Войти». */
+    private void prepareYouDoPageForLogin(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        try {
+            getCurrentManager().humanMouse(page);
+            getCurrentManager().humanDelay(page);
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> human перед cookie-баннером: {}", getSiteName(), e.getMessage());
+        }
+        long deadline = System.currentTimeMillis() + COOKIE_BANNER_SETTLE_MS;
+        while (System.currentTimeMillis() < deadline) {
+            ensureCookieBannerDismissed(page);
+            if (!isYouDoCookieConsentVisible(page)) {
+                page.waitForTimeout(250);
+            } else {
+                break;
+            }
+        }
+        ensureCookieBannerDismissed(page);
+    }
+
+    private void ensureCookieBannerDismissed(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        for (int i = 0; i < 8; i++) {
+            if (!isYouDoCookieConsentVisible(page)) {
+                return;
+            }
+            dismissCookieBanner(page);
+            page.waitForTimeout(200);
+        }
+    }
+
     private void dismissCookieBanner(Page page) {
         if (page == null || page.isClosed() || !isYouDoCookieConsentVisible(page)) {
             return;
@@ -861,7 +1013,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             try {
                 Locator btn = page.locator(selector).first();
                 if (btn.count() > 0 && btn.isVisible()) {
-                    btn.click(new Locator.ClickOptions().setTimeout(3000).setForce(true));
+                    clickLocator(page, btn);
                     log.info("АВТООТВЕТ: {} -> cookie-баннер закрыт", getSiteName());
                     page.waitForTimeout(300);
                     return;
@@ -956,7 +1108,10 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     }
 
     private boolean clickHeaderLoginUntilModal(Page page, String login) {
-        dismissCookieBanner(page);
+        if (page == null || page.isClosed()) {
+            return false;
+        }
+        ensureCookieBannerDismissed(page);
         if (isLoginModalOpen(page)) {
             return true;
         }
@@ -964,8 +1119,11 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         long deadline = System.currentTimeMillis() + LOGIN_CLICK_RETRY_MS;
         int round = 0;
         while (System.currentTimeMillis() < deadline) {
+            if (page.isClosed()) {
+                return false;
+            }
             round++;
-            dismissCookieBanner(page);
+            ensureCookieBannerDismissed(page);
             if (isLoginModalOpen(page)) {
                 return true;
             }
@@ -978,8 +1136,8 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                         continue;
                     }
                     locator.scrollIntoViewIfNeeded();
-                    getCurrentManager().humanDelay(page);
-                    clickLocator(locator);
+                    ensureCookieBannerDismissed(page);
+                    clickLocator(page, locator);
                     clicked = true;
                     log.info("АВТООТВЕТ: {} -> кнопка 'Войти' нажата ({}), раунд {}, пользователь: {}",
                             getSiteName(), selector, round, login);
@@ -987,12 +1145,18 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                     if (waitForLoginModalVisible(page, LOGIN_MODAL_WAIT_MS)) {
                         return true;
                     }
+                    if (isYouDoCookieConsentVisible(page)) {
+                        log.info("АВТООТВЕТ: {} -> cookie перекрыл модалку после «Войти», повтор, пользователь: {}",
+                                getSiteName(), login);
+                        break;
+                    }
                 } catch (Exception e) {
                     log.debug("АВТООТВЕТ: {} -> клик 'Войти' '{}': {}", getSiteName(), selector, e.getMessage());
                 }
             }
 
             if (!clicked) {
+                ensureCookieBannerDismissed(page);
                 clickHeaderLoginViaJs(page, login);
                 page.waitForTimeout(600);
                 if (waitForLoginModalVisible(page, LOGIN_MODAL_WAIT_MS)) {
@@ -1029,13 +1193,17 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     /** Ждём видимый контент модалки, не hidden nodes в DOM. */
     private boolean waitForLoginModalVisible(Page page, int timeoutMs) {
         long deadline = System.currentTimeMillis() + timeoutMs;
-        dismissCookieBanner(page);
+        ensureCookieBannerDismissed(page);
         while (System.currentTimeMillis() < deadline) {
             if (isLoginModalOpen(page)) {
                 return true;
             }
+            if (isYouDoCookieConsentVisible(page)) {
+                ensureCookieBannerDismissed(page);
+            }
             page.waitForTimeout(200);
         }
+        ensureCookieBannerDismissed(page);
         return isLoginModalOpen(page);
     }
 
@@ -1081,7 +1249,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             try {
                 Locator byText = page.getByText("электронную почту", new Page.GetByTextOptions().setExact(false)).first();
                 if (byText.count() > 0 && byText.isVisible()) {
-                    clickLocator(byText);
+                    clickLocator(page, byText);
                     log.info("АВТООТВЕТ: {} -> клик по тексту «электронную почту», пользователь: {}", getSiteName(), login);
                     page.waitForTimeout(700);
                     if (isEmailFieldVisible(page)) {
@@ -1131,7 +1299,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                     continue;
                 }
                 locator.scrollIntoViewIfNeeded();
-                clickLocator(locator);
+                clickLocator(page, locator);
                 log.info("АВТООТВЕТ: {} -> {} (селектор: {})", getSiteName(), step, selector);
                 return true;
             } catch (Exception e) {
@@ -1163,7 +1331,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                         .setState(WaitForSelectorState.VISIBLE)
                         .setTimeout(timeoutMs));
                 locator.scrollIntoViewIfNeeded();
-                clickLocator(locator);
+                clickLocator(page, locator);
                 log.info("АВТООТВЕТ: {} -> {} (селектор: {})", getSiteName(), step, selector);
                 return true;
             } catch (Exception e) {
@@ -1173,11 +1341,63 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         return false;
     }
 
-    private void clickLocator(Locator locator) {
+    /** Прогрев курсора и паузы перед действиями (как FL.ru / Weblancer). */
+    private void humanWarmupYouDo(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
         try {
-            locator.click();
+            humanWarmup(page);
+            getCurrentManager().humanScroll(page);
         } catch (Exception e) {
-            locator.click(new Locator.ClickOptions().setForce(true));
+            log.debug("АВТООТВЕТ: {} -> humanWarmupYouDo: {}", getSiteName(), e.getMessage());
+        }
+    }
+
+    /** Печать в поле с паузами; при сбое — обычный fill. */
+    private void humanTypeField(Page page, String selector, String text) {
+        if (page == null || page.isClosed() || text == null) {
+            return;
+        }
+        try {
+            getCurrentManager().humanMouse(page);
+            getCurrentManager().humanDelay(page);
+            getCurrentManager().humanType(page, selector, text);
+        } catch (Exception e) {
+            log.warn("АВТООТВЕТ: {} -> humanType '{}' не удался, fill: {}", getSiteName(), selector, e.getMessage());
+            page.fill(selector, text);
+        }
+    }
+
+    /** Клик через HumanInput; при перекрытии — штатный click, затем force. */
+    private void clickLocator(Page page, Locator locator) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        try {
+            getCurrentManager().humanDelay(page);
+            HumanInput.click(page, locator);
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> humanClick не удался: {}", getSiteName(), e.getMessage());
+            try {
+                locator.click(new Locator.ClickOptions().setTimeout(8_000));
+            } catch (Exception e2) {
+                locator.click(new Locator.ClickOptions().setForce(true).setTimeout(8_000));
+            }
+        }
+    }
+
+    /** После капчи / спиннера: сначала human-клик, при необходимости force. */
+    private void clickLocatorForceIfNeeded(Page page, Locator locator) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        try {
+            getCurrentManager().humanDelay(page);
+            HumanInput.click(page, locator);
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> humanClick (force path): {}", getSiteName(), e.getMessage());
+            locator.click(new Locator.ClickOptions().setForce(true).setTimeout(8_000));
         }
     }
 
@@ -1230,6 +1450,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             page.navigate(link);
             page.waitForLoadState(LoadState.NETWORKIDLE);
             log.info("АВТООТВЕТ: {} -> страница заказа открыта, пользователь: {}", getSiteName(), login);
+            humanWarmupYouDo(page);
             takeScreenshot(page, getSiteName(), payload.getUser().getUuid(), "order_page");
         } catch (Exception e) {
             report(Level.WARN, log,
@@ -1255,7 +1476,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         }
 
         try {
-            page.fill("input[placeholder='В рублях']", String.valueOf(defaultPrice));
+            humanTypeField(page, "input[placeholder='В рублях']", String.valueOf(defaultPrice));
             log.info("АВТООТВЕТ: {} -> цена установлена: {}, пользователь: {}", getSiteName(), defaultPrice, login);
         } catch (Exception e) {
             report(Level.WARN, log,
@@ -1274,7 +1495,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
 
         try {
             String replyText = payload.getDecision().reply();
-            page.fill("textarea.Textarea_textarea__FjgmX", replyText);
+            humanTypeField(page, "textarea.Textarea_textarea__FjgmX", replyText);
             log.info("АВТООТВЕТ: {} -> текст ответа вставлен, длина: {}, пользователь: {}", getSiteName(),
                     replyText != null ? replyText.length() : 0, login);
         } catch (Exception e) {
@@ -1307,8 +1528,8 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
 
         if (sendRequest) {
             try {
-                nextBtn.click();
-                //log.info("АВТООТВЕТ: {} -> кнопка 'Далее' нажата, пользователь: {}", getSiteName(), login);
+                getCurrentManager().humanDelay(page);
+                clickLocator(page, nextBtn);
                 log.info("АВТООТВЕТ: {} -> ЗАЯВКА УСПЕШНО ОТПРАВЛЕНА, пользователь: {}", getSiteName(), login);
             } catch (Exception e) {
                 report(Level.WARN, log,

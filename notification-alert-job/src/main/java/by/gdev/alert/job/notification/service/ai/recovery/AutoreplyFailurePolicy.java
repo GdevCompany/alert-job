@@ -3,7 +3,7 @@ package by.gdev.alert.job.notification.service.ai.recovery;
 import by.gdev.alert.job.notification.service.ai.metrics.errors.AutoreplyErrorTypes;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.common.service.playwright.captcha.failure.CaptchaFailureCode;
-import by.gdev.common.service.playwright.flru.FlRuPlaywrightGuards;
+import by.gdev.alert.job.notification.service.ai.parser.impl.flru.FlRuPlaywrightGuards;
 
 /**
  * Политика recovery по {@code errorCode} / тексту ошибки:
