@@ -5,6 +5,7 @@ import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
 import by.gdev.alert.job.notification.service.ai.sessions.AbstractAutoreplySessionVerifier;
 import by.gdev.common.model.SiteName;
+import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.options.LoadState;
 import lombok.extern.slf4j.Slf4j;
@@ -42,9 +43,15 @@ public class FreelanceRuSessionVerifier extends AbstractAutoreplySessionVerifier
             page.waitForLoadState(LoadState.NETWORKIDLE);
             page.waitForTimeout(1500);
             if (!page.url().contains("/auth/login")) {
-                log.info("SESSION-VERIFY: {} -> сессия активна (редирект с login), пользователь: {}",
+                if (isLoggedInOnSite(page)) {
+                    log.info("SESSION-VERIFY: {} -> сессия активна (редирект с login), пользователь: {}",
+                            getSiteName(), creds.login());
+                    return StepResult.ok(StepType.SEND_AUTOREPLY, null);
+                }
+                log.warn("SESSION-VERIFY: {} -> редирект с login, но в шапке «Вход» — гостевая/просроченная сессия, пользователь: {}",
                         getSiteName(), creds.login());
-                return StepResult.ok(StepType.SEND_AUTOREPLY, null);
+                return StepResult.fail(StepType.SEND_AUTOREPLY,
+                        "Сессия не авторизована (гость), нужен вход по логину и паролю");
             }
             if (waitOrFail(page, "input[placeholder='логин или email']", 3000, "Поле логина")) {
                 return StepResult.fail(StepType.SEND_AUTOREPLY, "Форма логина на /auth/login");
@@ -54,6 +61,33 @@ public class FreelanceRuSessionVerifier extends AbstractAutoreplySessionVerifier
                     "Остались на /auth/login, состояние сессии не подтверждено");
         } catch (Exception e) {
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Ошибка проверки сессии: " + e.getMessage());
+        }
+    }
+
+    /** Редирект с /auth/login бывает и у анонима — проверяем UI на главной. */
+    private boolean isLoggedInOnSite(Page page) {
+        safeNavigate(page, "https://freelance.ru/");
+        page.waitForLoadState(LoadState.NETWORKIDLE);
+        page.waitForTimeout(800);
+        try {
+            // Анонимы часто имеют plrs_anon; у авторизованных обычно есть sid
+            boolean hasSid = page.context().cookies("https://freelance.ru").stream()
+                    .anyMatch(c -> "sid".equals(c.name) && c.value != null && !c.value.isBlank());
+            if (hasSid) {
+                return true;
+            }
+            Locator loginLink = page.locator("a[href='/auth/login']");
+            if (loginLink.count() > 0 && loginLink.first().isVisible()) {
+                return false;
+            }
+            Locator registerLink = page.locator("a[href='/auth/register']");
+            if (registerLink.count() > 0 && registerLink.first().isVisible()) {
+                return false;
+            }
+            return true;
+        } catch (Exception e) {
+            log.debug("SESSION-VERIFY: {} -> не удалось проверить шапку: {}", getSiteName(), e.getMessage());
+            return false;
         }
     }
 }
