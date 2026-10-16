@@ -1,4 +1,4 @@
-package by.gdev.alert.job.notification.service.ai.parser.impl;
+package by.gdev.alert.job.notification.service.ai.parser.impl.flru;
 
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import lombok.Getter;

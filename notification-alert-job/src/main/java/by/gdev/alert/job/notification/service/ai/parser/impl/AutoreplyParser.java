@@ -453,7 +453,7 @@ public abstract class AutoreplyParser {
         page.waitForTimeout(pause);
     }
 
-    void safeNavigate(Page page, String url) {
+    protected void safeNavigate(Page page, String url) {
         for (int i = 1; i <= 5; i++) {
             try {
                 page.navigate(url, new Page.NavigateOptions().setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
@@ -476,7 +476,7 @@ public abstract class AutoreplyParser {
         }
     }*/
 
-    boolean waitOrFail(Page page, String selector, String step) {
+    protected boolean waitOrFail(Page page, String selector, String step) {
         long totalMs = timeouts.getElementWaitMs();
         long pollMs  = timeouts.getElementPollMs();
         long deadline = System.currentTimeMillis() + totalMs;
@@ -504,7 +504,7 @@ public abstract class AutoreplyParser {
     }
 
     /** Ждёт появления элемента в DOM и его видимости (для модалок и скрытых шаблонов). */
-    boolean waitForVisibleOrFail(Page page, String selector, String step) {
+    protected boolean waitForVisibleOrFail(Page page, String selector, String step) {
         long totalMs = timeouts.getElementWaitMs();
         try {
             page.locator(selector).first().waitFor(new Locator.WaitForOptions()
@@ -519,7 +519,7 @@ public abstract class AutoreplyParser {
         }
     }
 
-    boolean clickOrFail(Page page, String selector, String step) {
+    protected boolean clickOrFail(Page page, String selector, String step) {
         if (!waitOrFail(page, selector, step)) return false;
         try {
             getCurrentManager().humanClick(page, selector);
@@ -553,14 +553,16 @@ public abstract class AutoreplyParser {
             }
             return options;
         }
-        ProxyCredentials proxyCred = assignedProxyService.getProxyForUserAndModule(
-                payload.getUser().getUuid(),
-                payload.getModule().getId()
-        );
+        String userUuid = payload.getUser().getUuid();
+        Long moduleId = payload.getModule() != null ? payload.getModule().getId() : null;
+        ProxyCredentials proxyCred = assignedProxyService.getProxyForUserAndModule(userUuid, moduleId);
         if (proxyCred == null) {
-            proxyCred = managerResolver.getLocalManager().getProxyWithRetry(3, 500);
-            log.info("АВТООТВЕТ: {} -> нет закреплённого прокси, взят случайный: {}", site,
-                    proxyCred != null ? proxyCred.getHost() + ":" + proxyCred.getPort() : "нет активных");
+            proxyCred = assignedProxyService.getProxyForUserAndSite(userUuid, site);
+        }
+        if (proxyCred == null) {
+            proxyCred = assignedProxyService.pickWorkingProxyExcluding(site, state.triedHostPorts);
+            log.info("АВТООТВЕТ: {} -> нет закреплённого прокси, взят рабочий из пула: {}", site,
+                    proxyCred != null ? proxyCred.getHost() + ":" + proxyCred.getPort() : "нет проверенных");
         }
         state.lastUsed = proxyCred;
         if (state.lastUsed != null) {

@@ -68,6 +68,41 @@ public class CamoufoxLauncherClient {
         }
     }
 
+    /** Сообщает лаунчеру, что JVM всё ещё использует этот инстанс. */
+    public void heartbeat(String key) {
+        if (key == null || key.isBlank()) {
+            return;
+        }
+        post("/heartbeat", gson.toJson(Map.of("key", key)));
+    }
+
+    /** Список инстансов: state active/starting/stale/dead/idle, флаг in_use. */
+    public JsonObject listInstances() {
+        return get("/instances");
+    }
+
+    /** Убирает неиспользуемые (без heartbeat, мёртвые процессы, refs=0). */
+    public JsonObject cleanup(boolean dryRun) {
+        return post("/cleanup", gson.toJson(Map.of("dry_run", dryRun)));
+    }
+
+    private JsonObject get(String path) {
+        try {
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(launcherUrl + path))
+                    .timeout(Duration.ofSeconds(15))
+                    .GET()
+                    .build();
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                throw new RuntimeException("Launcher " + resp.statusCode() + ": " + resp.body());
+            }
+            return gson.fromJson(resp.body(), JsonObject.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Launcher error: " + e.getMessage(), e);
+        }
+    }
+
     private JsonObject post(String path, String json) {
         try {
             HttpRequest req = HttpRequest.newBuilder()

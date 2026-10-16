@@ -22,6 +22,9 @@ public enum CaptchaFailureCode {
     /** Форма логина — SmartCaptcha общий провал */
     FLRU_LOGIN_YANDEX_UNKNOWN,
 
+    /** YouDo / ServicePipe — Kaleidoscope, 2Captcha Pazl или извлечение task/canvas */
+    YOUDO_KALEIDOSCOPE_FAIL,
+
     /** Cloudflare / прочие */
     CAPTCHA_GENERIC,
     CAPTCHA_EXCEPTION

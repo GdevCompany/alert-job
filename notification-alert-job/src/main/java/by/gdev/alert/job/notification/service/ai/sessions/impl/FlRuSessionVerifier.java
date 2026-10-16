@@ -1,13 +1,13 @@
 package by.gdev.alert.job.notification.service.ai.sessions.impl;
 
 import by.gdev.alert.job.notification.model.dto.DecryptedCredential;
-import by.gdev.alert.job.notification.service.ai.flru.FlRuValidateCaptchaSupport;
+import by.gdev.alert.job.notification.service.ai.parser.impl.flru.FlRuValidateCaptchaSupport;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
 import by.gdev.alert.job.notification.service.ai.sessions.AbstractAutoreplySessionVerifier;
 import by.gdev.common.model.SiteName;
 import by.gdev.common.service.playwright.captcha.CaptchaService;
-import by.gdev.common.service.playwright.flru.FlRuPlaywrightGuards;
+import by.gdev.alert.job.notification.service.ai.parser.impl.flru.FlRuPlaywrightGuards;
 import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.Page;
 import lombok.extern.slf4j.Slf4j;
