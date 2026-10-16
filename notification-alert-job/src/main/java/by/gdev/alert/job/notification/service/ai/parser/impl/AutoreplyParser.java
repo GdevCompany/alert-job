@@ -23,6 +23,7 @@ import by.gdev.common.service.playwright.manager.PlaywrightBrowserManager;
 import by.gdev.common.service.playwright.manager.PlaywrightManagerResolver;
 import by.gdev.common.service.playwright.manager.impl.PlaywrightCamoufoxManager;
 import com.microsoft.playwright.*;
+import com.microsoft.playwright.options.WaitForSelectorState;
 import com.microsoft.playwright.options.WaitUntilState;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.event.Level;
@@ -500,6 +501,22 @@ public abstract class AutoreplyParser {
         log.warn("TIMEOUT at step '{}': '{}' не найдено за {} ms (attempts={})",
                 step, selector, totalMs, attempts);
         return false;
+    }
+
+    /** Ждёт появления элемента в DOM и его видимости (для модалок и скрытых шаблонов). */
+    protected boolean waitForVisibleOrFail(Page page, String selector, String step) {
+        long totalMs = timeouts.getElementWaitMs();
+        try {
+            page.locator(selector).first().waitFor(new Locator.WaitForOptions()
+                    .setState(WaitForSelectorState.VISIBLE)
+                    .setTimeout(totalMs));
+            log.info("OK at step '{}': '{}' видимо", step, selector);
+            return true;
+        } catch (Exception e) {
+            log.warn("TIMEOUT at step '{}': '{}' не видимо за {} ms: {}",
+                    step, selector, totalMs, e.getMessage());
+            return false;
+        }
     }
 
     protected boolean clickOrFail(Page page, String selector, String step) {

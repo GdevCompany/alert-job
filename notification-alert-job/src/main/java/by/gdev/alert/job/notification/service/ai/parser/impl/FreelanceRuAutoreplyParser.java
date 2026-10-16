@@ -56,6 +56,9 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
 
         try {
             safeNavigate(page, "https://freelance.ru/");
+            dismissCookieBannerIfPresent(page);
+            humanWarmup(page);
+            getCurrentManager().humanScroll(page);
             log.info("АВТООТВЕТ: {} -> главная страница загружена, пользователь: {}", getSiteName(), creds.login());
         } catch (Exception e) {
             report(Level.WARN, log,
@@ -80,8 +83,9 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Поле логина не найдено", captureScreenshot(page));
         }
 
+        humanInteractionPause(page);
         try {
-            page.fill("input[placeholder='логин или email']", creds.login());
+            getCurrentManager().humanType(page, "input[placeholder='логин или email']", creds.login());
             log.info("АВТООТВЕТ: {} -> логин заполнен: {}", getSiteName(), creds.login());
         } catch (Exception e) {
             report(Level.WARN, log,
@@ -91,8 +95,9 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось заполнить логин: " + e.getMessage(), captureScreenshot(page));
         }
 
+        humanInteractionPause(page);
         try {
-            page.fill("input[type='password']", creds.password());
+            getCurrentManager().humanType(page, "input[type='password']", creds.password());
             log.info("АВТООТВЕТ: {} -> пароль заполнен для пользователя: {}", getSiteName(), creds.login());
         } catch (Exception e) {
             report(Level.WARN, log,
@@ -102,6 +107,7 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось заполнить пароль: " + e.getMessage(), captureScreenshot(page));
         }
 
+        humanInteractionPause(page);
         if (!clickOrFail(page, "button:has-text('Войти')", "Кнопка 'Войти'")) {
             report(Level.WARN, log,
                     "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНА КНОПКА 'Войти', пользователь: " + creds.login(),
@@ -153,6 +159,9 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
         try {
             page.navigate(link);
             page.waitForLoadState(LoadState.NETWORKIDLE);
+            dismissCookieBannerIfPresent(page);
+            humanWarmup(page);
+            getCurrentManager().humanScroll(page);
             log.info("АВТООТВЕТ: {} -> страница заказа открыта, пользователь: {}", getSiteName(), login);
             takeScreenshot(page, getSiteName(), payload.getUser().getUuid(), "order_page");
         } catch (Exception e) {
@@ -163,29 +172,46 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось открыть заказ: " + e.getMessage(), captureScreenshot(page));
         }
 
-        if (!clickOrFail(page,
-                "button.btn.btn--success.btn--lg.btn--block:has-text('Откликнуться')",
-                "Кнопка 'Откликнуться'")) {
-            report(Level.WARN, log,
-                    "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНА КНОПКА 'Откликнуться', пользователь: " + login,
-                    AutoreplyErrorTypes.BUTTON_NOT_FOUND);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Кнопка 'Откликнуться' не найдена", captureScreenshot(page));
-        }
-        log.info("АВТООТВЕТ: {} -> кнопка 'Откликнуться' нажата, пользователь: {}", getSiteName(), login);
+        // Новая вёрстка: карточка #rootReplyCard с textarea#rootReplyText и кнопкой #rootCreateReply.
+        // Старая: модалка после клика по «Откликнуться» и скрытый шаблон #replyText.
+        String replySelector = "textarea#rootReplyText";
+        String sendSelector = "button#rootCreateReply";
 
-        if (!waitOrFail(page,
-                "textarea#replyText[name='TaskReply[text]']",
-                "Поле ответа")) {
-            report(Level.WARN, log,
-                    "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНО ПОЛЕ ОТВЕТА, пользователь: " + login,
-                    AutoreplyErrorTypes.FIELD_NOT_FOUND);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Поле ответа не найдено", captureScreenshot(page));
+        if (!waitForVisibleOrFail(page, replySelector, "Поле ответа (rootReplyText)")) {
+            log.info("АВТООТВЕТ: {} -> форма root не найдена, пробуем старый сценарий с модалкой, пользователь: {}",
+                    getSiteName(), login);
+            if (!clickOrFail(page,
+                    "#rootCreateReply, button.btn.btn--success.btn--lg:has-text('Откликнуться')",
+                    "Кнопка 'Откликнуться'")) {
+                report(Level.WARN, log,
+                        "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНА КНОПКА 'Откликнуться', пользователь: " + login,
+                        AutoreplyErrorTypes.BUTTON_NOT_FOUND);
+                return StepResult.fail(StepType.SEND_AUTOREPLY, "Кнопка 'Откликнуться' не найдена", captureScreenshot(page));
+            }
+            replySelector = "textarea#replyText[name='TaskReply[text]']";
+            sendSelector = "button#createReply.btn.btn--success.btn--sm";
+            if (!waitForVisibleOrFail(page, replySelector, "Поле ответа (replyText)")) {
+                report(Level.WARN, log,
+                        "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНО ВИДИМОЕ ПОЛЕ ОТВЕТА, пользователь: " + login,
+                        AutoreplyErrorTypes.FIELD_NOT_FOUND);
+                return StepResult.fail(StepType.SEND_AUTOREPLY, "Поле ответа не найдено или скрыто", captureScreenshot(page));
+            }
+        } else {
+            humanInteractionPause(page);
+            try {
+                page.locator(replySelector).first().scrollIntoViewIfNeeded();
+            } catch (Exception ignored) {
+                // scroll optional
+            }
         }
 
         try {
-            page.fill("textarea#replyText[name='TaskReply[text]']", payload.getDecision().reply());
+            fillRootReplyMetaIfPresent(page);
+            humanInteractionPause(page);
+            String replyText = payload.getDecision().reply();
+            getCurrentManager().humanType(page, replySelector, replyText);
             log.info("АВТООТВЕТ: {} -> текст ответа вставлен, длина: {}, пользователь: {}", getSiteName(),
-                    payload.getDecision().reply() != null ? payload.getDecision().reply().length() : 0, login);
+                    replyText != null ? replyText.length() : 0, login);
         } catch (Exception e) {
             report(Level.WARN, log,
                     "АВТООТВЕТ: " + getSiteName() + " -> НЕ УДАЛОСЬ ЗАПОЛНИТЬ ТЕКСТ ОТВЕТА, пользователь: "
@@ -194,17 +220,15 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось заполнить текст ответа: " + e.getMessage(), captureScreenshot(page));
         }
 
-        if (!waitOrFail(page,
-                "button#createReply.btn.btn--success.btn--sm",
-                "Кнопка отправки")) {
+        if (!waitForVisibleOrFail(page, sendSelector, "Кнопка отправки отклика")) {
             report(Level.WARN, log,
                     "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНА КНОПКА ОТПРАВКИ, пользователь: " + login,
                     AutoreplyErrorTypes.BUTTON_NOT_FOUND);
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Кнопка отправки не найдена", captureScreenshot(page));
         }
-        log.info("АВТООТВЕТ: {} -> кнопка отправки найдена, пользователь: {}", getSiteName(), login);
+        log.info("АВТООТВЕТ: {} -> кнопка отправки найдена: {}, пользователь: {}", getSiteName(), sendSelector, login);
 
-        Locator sendBtn = page.locator("button#createReply.btn.btn--success.btn--sm");
+        Locator sendBtn = page.locator(sendSelector).locator("visible=true").first();
         try {
             page.waitForCondition(sendBtn::isEnabled,
                     new Page.WaitForConditionOptions().setTimeout(5000));
@@ -219,7 +243,8 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
 
         if (sendRequest) {
             try {
-                sendBtn.click();
+                humanInteractionPause(page);
+                getCurrentManager().humanClick(page, sendSelector);
                 log.info("АВТООТВЕТ: {} -> ЗАЯВКА УСПЕШНО ОТПРАВЛЕНА, пользователь: {}", getSiteName(), login);
             } catch (Exception e) {
                 report(Level.WARN, log,
@@ -229,12 +254,54 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
                 return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось нажать кнопку отправки: " + e.getMessage(), captureScreenshot(page));
             }
         } else {
-            log.info("АВТООТВЕТ: {} -> ЗАЯВКА НЕ ОТПРАВЛЕНА (sendRequest=false), пользователь: {}", getSiteName(), login);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Заявка не отправлена (sendRequest=false)", captureScreenshot(page));
+            log.info("АВТООТВЕТ: {} -> dry-run: форма заполнена, клик по отправке пропущен (sendRequest=false), пользователь: {}",
+                    getSiteName(), login);
+            return StepResult.ok(StepType.SEND_AUTOREPLY, null);
         }
 
         page.waitForTimeout(2000);
         log.info("АВТООТВЕТ: {} -> ОТКЛИК УСПЕШНО ЗАВЕРШЁН, пользователь: {}", getSiteName(), login);
         return StepResult.ok(StepType.SEND_AUTOREPLY, null);
+    }
+
+    private void dismissCookieBannerIfPresent(Page page) {
+        try {
+            Locator accept = page.locator("#cookie-accept");
+            if (accept.count() > 0 && accept.first().isVisible()) {
+                humanInteractionPause(page);
+                getCurrentManager().humanClick(page, "#cookie-accept");
+                page.waitForTimeout(400);
+                log.debug("АВТООТВЕТ: {} -> закрыт баннер cookies", getSiteName());
+            }
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> баннер cookies: {}", getSiteName(), e.getMessage());
+        }
+    }
+
+    /** Пауза с движением мыши и прокруткой, как на Weblancer / FL.ru. */
+    private void humanInteractionPause(Page page) {
+        getCurrentManager().humanMouse(page);
+        getCurrentManager().humanDelay(page);
+        getCurrentManager().humanScroll(page);
+    }
+
+    /** Срок и цена в карточке отклика (#rootReplyDays / #rootReplyPrice), если поля пустые. */
+    private void fillRootReplyMetaIfPresent(Page page) {
+        try {
+            Locator days = page.locator("#rootReplyDays");
+            if (days.count() > 0 && days.first().isVisible()
+                    && (days.first().inputValue() == null || days.first().inputValue().isBlank())) {
+                humanInteractionPause(page);
+                getCurrentManager().humanType(page, "#rootReplyDays", String.valueOf(defaultDays));
+            }
+            Locator price = page.locator("#rootReplyPrice");
+            if (price.count() > 0 && price.first().isVisible()
+                    && (price.first().inputValue() == null || price.first().inputValue().isBlank())) {
+                humanInteractionPause(page);
+                getCurrentManager().humanType(page, "#rootReplyPrice", String.valueOf(defaultPrice));
+            }
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> не заполнили срок/цену: {}", getSiteName(), e.getMessage());
+        }
     }
 }
