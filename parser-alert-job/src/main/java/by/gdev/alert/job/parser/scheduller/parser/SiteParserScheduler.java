@@ -3,6 +3,7 @@ package by.gdev.alert.job.parser.scheduller.parser;
 import by.gdev.alert.job.parser.scheduller.parser.properties.ParserScheduleProperties;
 import by.gdev.alert.job.parser.service.order.SiteParser;
 import by.gdev.common.model.OrderDTO;
+import by.gdev.common.service.proxy.ProxyCheckGate;
 import com.microsoft.playwright.PlaywrightException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.TaskScheduler;
@@ -15,14 +16,17 @@ public class SiteParserScheduler {
 
     private final SiteParser parser;
     private final OrderDispatcher dispatcher;
+    private final ProxyCheckGate proxyCheckGate;
 
 
     public SiteParserScheduler(SiteParser parser,
                                OrderDispatcher dispatcher,
                                ParserScheduleProperties props,
-                               TaskScheduler taskScheduler) {
+                               TaskScheduler taskScheduler,
+                               ProxyCheckGate proxyCheckGate) {
         this.parser = parser;
         this.dispatcher = dispatcher;
+        this.proxyCheckGate = proxyCheckGate;
 
         // регистрируем задачу прямо в конструкторе
         if (parser.isActive()){
@@ -39,6 +43,10 @@ public class SiteParserScheduler {
     }
 
     private void runParser() {
+        if (!proxyCheckGate.mayRunProxyConsumers()) {
+            log.info("Парсер {} пропущен: первая проверка прокси при старте ещё не завершена", parser.getSiteName());
+            return;
+        }
         log.debug("Запуск парсера {} в потоке {}", parser.getSiteName(), Thread.currentThread().getName());
         try {
             long startTime = System.currentTimeMillis();

@@ -127,6 +127,8 @@ public class PlaywrightManager implements PlaywrightBrowserManager {
                     try { Thread.sleep(retryDelayMs * attempt); }
                     catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
                 }
+            } catch (IllegalStateException e) {
+                log.warn("Попытка {}/{}: {}", attempt, maxRetries, e.getMessage());
             } catch (Exception e) {
                 log.error("Ошибка получения прокси с попытки {}: {}", attempt, e.getMessage(), e);
             }
