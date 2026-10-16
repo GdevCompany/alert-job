@@ -10,7 +10,7 @@ import by.gdev.alert.job.notification.service.ai.parser.AutoreplyPlaywrightParse
 import by.gdev.alert.job.notification.service.ai.proxy.AssignedProxyService;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
-import by.gdev.alert.job.notification.service.ai.recovery.AutoreplyFailureAction;
+import by.gdev.alert.job.notification.service.ai.recovery.AutoreplyProxyFailures;
 import by.gdev.common.model.SiteName;
 import by.gdev.common.service.playwright.captcha.failure.CaptchaFailureInfo;
 import by.gdev.common.service.playwright.captcha.CaptchaService;
@@ -142,9 +142,6 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
     /** Максимум ждать, пока на странице снова станет доступна ссылка повторной отправки. */
     @Value("${parser.autoreply.fl.ru.otp.resend.cooldown.max-wait.ms:120000}")
     private long otpResendCooldownMaxWaitMs;
-
-    @Value("${parser.autoreply.fl.ru.ddos.proxy.max-attempts:3}")
-    private int ddosProxyMaxAttempts;
 
     @Value("${parser.autoreply.headless.fl.ru:true}")
     private void setHeadless(boolean headless) {
@@ -313,16 +310,8 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
     }
 
     @Override
-    protected int autoreplyProxySwitchMaxAttempts() {
-        return Math.max(1, ddosProxyMaxAttempts);
-    }
-
-    @Override
     protected boolean skipLoginAfterVerifyFailure(StepResult<Void> verifyResult, AutoreplyMode autoreplyMode) {
-        if (autoreplyMode == AutoreplyMode.LOGIN_ONLY) {
-            return false;
-        }
-        return resolveFailureAction(verifyResult) == AutoreplyFailureAction.ROTATE_PROXY;
+        return false;
     }
 
     @Override
@@ -404,12 +393,14 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
                     report(Level.WARN, log,
                             "АВТООТВЕТ: " + getSiteName() + " -> НЕВЕРНЫЙ ЛОГИН/ПАРОЛЬ, пользователь: " + creds.login(),
                             AutoreplyErrorTypes.LOGIN_FAILED);
-                    return StepResult.fail(StepType.SEND_AUTOREPLY, "Неверный логин/пароль", captureScreenshot(page));
+                    return StepResult.fail(StepType.SEND_AUTOREPLY, AutoreplyErrorTypes.LOGIN_FAILED,
+                            "Неверный логин/пароль", captureScreenshot(page));
                 }
                 report(Level.WARN, log,
                         "АВТООТВЕТ: " + getSiteName() + " -> ВХОД НЕ ВЫПОЛНЕН, остались на странице логина, пользователь: " + creds.login(),
                         AutoreplyErrorTypes.LOGIN_FAILED);
-                return StepResult.fail(StepType.SEND_AUTOREPLY, "Остались на странице логина", captureScreenshot(page));
+                return StepResult.fail(StepType.SEND_AUTOREPLY, AutoreplyErrorTypes.LOGIN_FAILED,
+                        "Остались на странице логина", captureScreenshot(page));
             }
 
             log.info("АВТООТВЕТ: {} -> ЛОГИН УСПЕШЕН (этап={}), пользователь: {}", getSiteName(), stage, creds.login());
@@ -420,11 +411,16 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
             return stepFailure.getStepResult();
         } catch (Exception e) {
             log.error("АВТООТВЕТ: {} -> ОШИБКА ПРИ ЛОГИНЕ, пользователь: {}, ошибка: {}", getSiteName(), creds.login(), e.getMessage(), e);
+            String message = "Ошибка при логине: " + e.getMessage();
+            String code = AutoreplyProxyFailures.errorCodeForThrowable(e);
+            if (code == null) {
+                code = AutoreplyErrorTypes.LOGIN_FAILED;
+            }
             report(Level.ERROR, log,
                     "АВТООТВЕТ: " + getSiteName() + " -> ОШИБКА ПРИ ЛОГИНЕ, пользователь: "
                             + creds.login() + ", ошибка: " + e.getMessage(),
-                    AutoreplyErrorTypes.LOGIN_FAILED);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Ошибка при логине: " + e.getMessage(), captureScreenshot(page));
+                    code);
+            return StepResult.fail(StepType.SEND_AUTOREPLY, code, message, captureScreenshot(page));
         }
     }
 
@@ -502,7 +498,8 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
             report(Level.WARN, log,
                     "АВТООТВЕТ: " + getSiteName() + " -> НЕВЕРНЫЙ ЛОГИН/ПАРОЛЬ, пользователь: " + creds.login(),
                     AutoreplyErrorTypes.LOGIN_FAILED);
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Неверный логин/пароль", captureScreenshot(page));
+            return StepResult.fail(StepType.SEND_AUTOREPLY, AutoreplyErrorTypes.LOGIN_FAILED,
+                            "Неверный логин/пароль", captureScreenshot(page));
         }
         return null;
     }
@@ -606,7 +603,8 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
                     report(Level.WARN, log,
                             "АВТООТВЕТ: " + getSiteName() + " -> НЕВЕРНЫЙ ЛОГИН/ПАРОЛЬ, пользователь: " + creds.login(),
                             AutoreplyErrorTypes.LOGIN_FAILED);
-                    return StepResult.fail(StepType.SEND_AUTOREPLY, "Неверный логин/пароль", captureScreenshot(page));
+                    return StepResult.fail(StepType.SEND_AUTOREPLY, AutoreplyErrorTypes.LOGIN_FAILED,
+                            "Неверный логин/пароль", captureScreenshot(page));
                 }
                 case LOGIN_FORM -> {
                     if (allowLoginForm) {
@@ -616,7 +614,8 @@ public class FlRuAutoreplyParser extends AutoreplyParser implements AutoreplyPla
                             "АВТООТВЕТ: " + getSiteName() + " -> ВХОД НЕ ВЫПОЛНЕН, остались на странице логина, пользователь: "
                                     + creds.login(),
                             AutoreplyErrorTypes.LOGIN_FAILED);
-                    return StepResult.fail(StepType.SEND_AUTOREPLY, "Остались на странице логина", captureScreenshot(page));
+                    return StepResult.fail(StepType.SEND_AUTOREPLY, AutoreplyErrorTypes.LOGIN_FAILED,
+                        "Остались на странице логина", captureScreenshot(page));
                 }
                 case LOGGED_IN -> {
                     return null;

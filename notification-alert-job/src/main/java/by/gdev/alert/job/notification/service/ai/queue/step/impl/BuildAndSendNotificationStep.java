@@ -5,6 +5,8 @@ import by.gdev.alert.job.notification.model.dto.AiNotificationPayload;
 import by.gdev.alert.job.notification.service.MailService;
 import by.gdev.alert.job.notification.service.ai.queue.step.AiStep;
 import by.gdev.alert.job.notification.service.ai.queue.step.RetrySupport;
+import by.gdev.alert.job.notification.service.ai.metrics.errors.AutoreplyErrorTypes;
+import by.gdev.alert.job.notification.service.ai.recovery.AutoreplyProxyFailures;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
 import by.gdev.common.model.NotificationType;
@@ -106,6 +108,15 @@ public class BuildAndSendNotificationStep implements AiStep<AiNotificationPayloa
             otpInfoText = "Ожидался OTP: " + payload.getOtpValue() + "\n";
         }
 
+        String proxyHintHtml = "";
+        String proxyHintText = "";
+        if (AutoreplyErrorTypes.PROXY_FAILED.equals(errorResult.getErrorCode())
+                || AutoreplyProxyFailures.isProxyRelated(errorResult)) {
+            proxyHintHtml = "<p><strong>Вероятная причина:</strong> проблема с прокси "
+                    + "(таймаут, обрыв соединения, блок IP на бирже).</p>";
+            proxyHintText = "Вероятная причина: проблема с прокси.\n";
+        }
+
         UserNotification n = new UserNotification();
         n.setType(NotificationType.AUTO_REPLY_ERROR);
         String subject = "Ошибка при отправке автоответа на шаге \"" + stepName + "\"";
@@ -118,11 +129,12 @@ public class BuildAndSendNotificationStep implements AiStep<AiNotificationPayloa
     <p>Ошибка произошла на шаге: <strong>%s</strong></p>
     <p><strong>Модуль:</strong> %s</p>
     %s
+    %s
     <p><strong>Заказ:</strong> %s</p>
     <p><strong>Ссылка:</strong> <a href="%s">%s</a></p>
     <p>Если в письме есть вложение, проверьте скриншот для диагностики.</p>
     <p>С уважением,<br>Система автоответов</p>
-    """, errorMessage, stepName, moduleName, otpInfoHtml, orderTitle, orderLink, orderLink);
+    """, errorMessage, stepName, moduleName, otpInfoHtml, proxyHintHtml, orderTitle, orderLink, orderLink);
 
         if (NotificationTypeEnum.EMAIL.equals(payload.getNotificationType())) {
             log.info("АВТООТВЕТ: {} -> отправка EMAIL об ошибке на: {}", payload.getModule().getName(), user.getEmail());
@@ -142,6 +154,7 @@ public class BuildAndSendNotificationStep implements AiStep<AiNotificationPayloa
             String telegramText = "Модуль: " + moduleName + "\n" +
                     "Ошибка автоответа: " + errorMessage + " (шаг: " + stepName + ")\n" +
                     otpInfoText +
+                    proxyHintText +
                     "Заказ: " + orderTitle + "\n" +
                     "Ссылка: " + orderLink;
             log.info("АВТООТВЕТ: {} -> TELEGRAM об ошибке: {}", payload.getModule().getName(), telegramText);
