@@ -1,6 +1,7 @@
 package by.gdev.common.service.proxy;
 
 import by.gdev.common.model.proxy.ProxyCredentials;
+import by.gdev.common.model.proxy.ProxyState;
 import by.gdev.common.service.proxy.event.ProxyListUpdatedEvent;
 import by.gdev.common.service.proxy.supplier.ProxySupplier;
 import lombok.RequiredArgsConstructor;
@@ -28,7 +29,13 @@ public class ProxyUpdateScheduler {
     @Value("${proxy.checker.country-filter.enabled:true}")
     private boolean countryFilterEnabled;
 
-    @Scheduled(fixedDelayString = "#{${parser.proxy.refresh-interval-hours:24} * 60 * 60 * 1000}")
+    /** Не гонять вторую полную проверку сразу после стартовой (мс). */
+    @Value("${proxy.checker.grace-after-check-ms:900000}")
+    private long graceAfterCheckMs;
+
+    @Scheduled(
+            initialDelayString = "${proxy.checker.supplier-refresh-initial-delay-ms:900000}",
+            fixedDelayString = "#{${parser.proxy.refresh-interval-hours:24} * 60 * 60 * 1000}")
     public void refreshProxies() {
         log.info("Проверка списка прокси на обновления... (интервал {} ч., country-filter={})",
                 refreshIntervalHours, countryFilterEnabled);
@@ -57,8 +64,20 @@ public class ProxyUpdateScheduler {
         log.warn("Всего прокси после обновления: {} (SUPPLIER: {}, API: {})",
                 totalAfter, newSupplierCount, apiCount);
 
-        // Проверяем все прокси (включая API)
-        proxyCheckerService.checkAllProxies(countryFilterEnabled);
+        if (ProxyCheckerService.isWithinCheckGracePeriod(graceAfterCheckMs)) {
+            log.info("Прокси SUPPLIER обновлены; полная перепроверка пропущена (недавно была проверка при старте)");
+            eventPublisher.publishEvent(new ProxyListUpdatedEvent(this, proxySupplier.getProxies()));
+            return;
+        }
+
+        ProxyCheckerService.ProxyCheckSummary summary =
+                proxyCheckerService.checkAllProxies(countryFilterEnabled);
+        long active = proxySupplier.getProxies().stream()
+                .filter(p -> p.getState() == ProxyState.ACTIVE || p.getState() == ProxyState.WARMING_UP)
+                .count();
+        log.info("Прокси (сводка после обновления SUPPLIER): за {}, рабочих {}/{}, активных {}, всего {}",
+                ProxyCheckerService.formatCheckDuration(summary.elapsedMs()),
+                summary.working(), summary.total(), active, summary.total());
         eventPublisher.publishEvent(new ProxyListUpdatedEvent(this, proxySupplier.getProxies()));
     }
 }

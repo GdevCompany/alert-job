@@ -143,10 +143,9 @@ public class BuildAndSendNotificationStep implements AiStep<AiNotificationPayloa
 
             byte[] screenshot = errorResult.getScreenshot();
             if (screenshot != null && screenshot.length > 0) {
-                mailService.sendMessageWithAttachment(n, "error_screenshot.png", screenshot)
-                        .subscribe();
+                mailService.sendMessageWithAttachment(n, "error_screenshot.png", screenshot).block();
             } else {
-                mailService.sendMessage(n);
+                mailService.sendMessage(n).block();
             }
             log.info("АВТООТВЕТ: {} -> EMAIL об ошибке отправлен на {}", payload.getModule().getName(), user.getEmail());
 
