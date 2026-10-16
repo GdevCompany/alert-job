@@ -4,6 +4,7 @@ import by.gdev.alert.job.notification.service.ai.metrics.errors.AutoreplyErrorTy
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.common.service.playwright.captcha.failure.CaptchaFailureCode;
 import by.gdev.alert.job.notification.service.ai.parser.impl.flru.FlRuPlaywrightGuards;
+import by.gdev.alert.job.notification.service.ai.parser.youdo.YouDoPlaywrightGuards;
 
 /**
  * Политика recovery по {@code errorCode} / тексту ошибки:
@@ -23,6 +24,9 @@ public final class AutoreplyFailurePolicy {
 
     public static AutoreplyFailureAction resolve(String errorCode, String message) {
         if (message != null && message.contains(FlRuPlaywrightGuards.DDOS_RETRY_FAIL_MARKER)) {
+            return AutoreplyFailureAction.ROTATE_PROXY;
+        }
+        if (message != null && message.contains(YouDoPlaywrightGuards.PROXY_BLOCKED_MARKER)) {
             return AutoreplyFailureAction.ROTATE_PROXY;
         }
         if (errorCode == null || errorCode.isBlank()) {
@@ -54,7 +58,8 @@ public final class AutoreplyFailurePolicy {
                  AutoreplyErrorTypes.ERROR_OPEN_PAGE,
                  "YOUDO_EMAIL_SUBMIT_STUCK",
                  "YOUDO_LOGIN_STAGE_LOOP",
-                 "YOUDO_LOGIN_UNKNOWN_STAGE" -> AutoreplyFailureAction.ROTATE_PROXY;
+                 "YOUDO_LOGIN_UNKNOWN_STAGE",
+                 YouDoPlaywrightGuards.YOUDO_PROXY_BLOCKED_CODE -> AutoreplyFailureAction.ROTATE_PROXY;
             case AutoreplyErrorTypes.LOGIN_FAILED,
                  AutoreplyErrorTypes.OTP_NOT_RECEIVED,
                  AutoreplyErrorTypes.FIELD_NOT_FOUND,

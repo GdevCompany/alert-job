@@ -37,6 +37,8 @@ public class YouDoSmartCaptchaSupport {
 
     private final YouDoModalLayoutFix modalLayoutFix;
 
+    private final YouDoPostCaptchaSubmit postCaptchaSubmit;
+
     @Value("${captcha.yandex.two-captcha-fallback:true}")
     private boolean yandexTwoCaptchaFallback;
 
@@ -66,6 +68,23 @@ public class YouDoSmartCaptchaSupport {
     /** SmartCaptcha в DOM (в т.ч. скрытый div до iframe) на форме логина. */
     public boolean isSmartCaptchaShellPresent(Page page) {
         return isSmartCaptchaShellInLoginModal(page) || isSmartCaptchaShellAnywhere(page);
+    }
+
+    /**
+     * Нужно ли считать экран «стадией капчи» для FSM логина.
+     * Скрытые iframe после успешного smart-token не блокируют переход к email/OTP.
+     */
+    public boolean blocksYouDoLoginStage(Page page) {
+        if (page == null || page.isClosed()) {
+            return false;
+        }
+        if (isSmartCaptchaStage(page)) {
+            return true;
+        }
+        if (captchaService.smartCaptchaTokenLength(page) > 20) {
+            return false;
+        }
+        return isLoginCaptchaGate(page) || isSmartCaptchaShellPresent(page);
     }
 
     public CaptchaKind detectCaptchaKind(Page page) {
@@ -229,6 +248,7 @@ public class YouDoSmartCaptchaSupport {
                 log.info("YOUDO SmartCaptcha: smart-token в DOM, видимого challenge нет — пропускаем");
                 captchaService.logSmartCaptchaResolutionVerdict(page,
                         "youdo-login-attempt-" + attempt + "-skip-token-in-dom user=" + login);
+                trySubmitEmailAfterToken(page, login);
                 return true;
             }
             captchaService.waitForYandexSmartCaptchaWidget(page, 12_000);
@@ -259,6 +279,7 @@ public class YouDoSmartCaptchaSupport {
                 log.info("YOUDO SmartCaptcha снята после попытки {}, пользователь: {}", attempt, login);
                 captchaService.logSmartCaptchaResolutionVerdict(page,
                         "youdo-login-attempt-" + attempt + "-stage-clear user=" + login);
+                trySubmitEmailAfterToken(page, login);
                 return true;
             }
             if (!progressed) {
@@ -412,6 +433,24 @@ public class YouDoSmartCaptchaSupport {
         }
         logDetectedCaptchaUi(page, login, attempt, "после-solve");
         return any;
+    }
+
+    private void trySubmitEmailAfterToken(Page page, String login) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        if (captchaService.smartCaptchaTokenLength(page) < 20) {
+            return;
+        }
+        try {
+            Locator email = page.locator("input[name='login']").first();
+            if (email.count() == 0 || !email.isVisible()) {
+                return;
+            }
+        } catch (Exception e) {
+            return;
+        }
+        postCaptchaSubmit.submitEmailAfterSmartToken(page, login);
     }
 
     private boolean solveCheckbox(Page page, String login, int attempt, String reason) {

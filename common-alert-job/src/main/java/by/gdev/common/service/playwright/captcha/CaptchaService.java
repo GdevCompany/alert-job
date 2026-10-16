@@ -607,6 +607,57 @@ public class CaptchaService {
         }
     }
 
+    /**
+     * YouDo: после 2Captcha full-screen {@code advanced-iframe} часто остаётся в DOM и перехватывает клик по «Далее».
+     */
+    public void suppressYouDoLoginCaptchaClickBlockers(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        dismissSmartCaptchaOverlay(page);
+        try {
+            page.evaluate(
+                    """
+                            () => {
+                              const hide = (el) => {
+                                if (!el) return;
+                                el.style.setProperty('pointer-events', 'none', 'important');
+                                el.style.setProperty('visibility', 'hidden', 'important');
+                                el.style.setProperty('opacity', '0', 'important');
+                                el.style.setProperty('z-index', '-1', 'important');
+                              };
+                              document.querySelectorAll(
+                                'iframe[data-testid="advanced-iframe"], iframe[src*="smartcaptcha"]'
+                              ).forEach((iframe) => {
+                                const r = iframe.getBoundingClientRect();
+                                if (r.width > 400 || r.height > 400) {
+                                  hide(iframe);
+                                }
+                              });
+                              document.querySelectorAll(
+                                '[data-sentry-component="SmartCaptcha"], [data-testid="smartCaptcha-container"], .smart-captcha'
+                              ).forEach((host) => {
+                                const dialog = document.querySelector('[role="dialog"]');
+                                if (dialog && dialog.contains(host)) {
+                                  host.style.setProperty('pointer-events', 'none', 'important');
+                                  host.style.setProperty('max-height', '1px', 'important');
+                                  host.style.setProperty('overflow', 'hidden', 'important');
+                                }
+                              });
+                            }
+                            """);
+            log.debug("SmartCaptcha/YouDo: click-blockers сняты (iframe/host)");
+        } catch (Exception e) {
+            log.debug("SmartCaptcha/YouDo: suppress blockers: {}", e.getMessage());
+        }
+    }
+
+    /** Подготовка формы email YouDo сразу после внешнего smart-token. */
+    public void prepareYouDoEmailSubmitAfterSmartToken(Page page) {
+        suppressYouDoLoginCaptchaClickBlockers(page);
+        resumeYandexSmartCaptchaForForm(page);
+    }
+
     public boolean isSmartCaptchaOverlayVisible(Page page) {
         try {
             Locator overlay = page.locator(
@@ -1536,10 +1587,17 @@ public class CaptchaService {
                               'input[name="smart_token"]',
                               'input[data-testid="smart-token"]'
                             ];
+                            const desc = Object.getOwnPropertyDescriptor(
+                              window.HTMLInputElement.prototype, 'value');
+                            const setter = desc && desc.set;
                             for (const sel of selectors) {
                               const el = root.querySelector(sel);
                               if (el) {
-                                el.value = token;
+                                if (setter) {
+                                  setter.call(el, token);
+                                } else {
+                                  el.value = token;
+                                }
                                 el.dispatchEvent(new Event('input', { bubbles: true }));
                                 el.dispatchEvent(new Event('change', { bubbles: true }));
                                 return true;
@@ -1547,8 +1605,21 @@ public class CaptchaService {
                             }
                             return false;
                           };
-                          if (!setHidden(document)) {
-                            const form = document.querySelector('form');
+                          const roots = [];
+                          const dialog = document.querySelector('[role="dialog"]');
+                          if (dialog) roots.push(dialog);
+                          document.querySelectorAll('[data-sentry-component="SmartCaptcha"], .smart-captcha, [data-sitekey]')
+                            .forEach((el) => roots.push(el));
+                          roots.push(document);
+                          let placed = false;
+                          for (const root of roots) {
+                            if (setHidden(root)) {
+                              placed = true;
+                            }
+                          }
+                          if (!placed) {
+                            const login = document.querySelector('input[name="login"]');
+                            const form = login ? login.closest('form') : document.querySelector('form');
                             if (form) {
                               const input = document.createElement('input');
                               input.type = 'hidden';
@@ -1596,6 +1667,9 @@ public class CaptchaService {
             log.debug("SmartCaptcha/2Captcha: postMessage во frame: {}", e.getMessage());
         }
         dismissSmartCaptchaOverlay(page);
+        if (page.url() != null && page.url().contains("youdo")) {
+            suppressYouDoLoginCaptchaClickBlockers(page);
+        }
         resumeYandexSmartCaptchaForForm(page);
         log.info("SmartCaptcha/2Captcha: token применён на странице, len={}", token != null ? token.length() : 0);
         logSmartCaptchaResolutionVerdict(page, "after-apply-token");

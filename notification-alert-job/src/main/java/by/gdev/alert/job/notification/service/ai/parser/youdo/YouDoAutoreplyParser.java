@@ -65,7 +65,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     private static final String YOUDO_EMAIL_SUBMIT_STUCK_MESSAGE =
             "YouDo: отправка email зависла после капчи (спиннер на «Далее»). Попробуем другой прокси.";
 
-    private static final int YOUDO_POST_CAPTCHA_NEXT_MAX = 1;
+    private static final int YOUDO_POST_CAPTCHA_NEXT_MAX = 3;
     private static final int YOUDO_POST_SUBMIT_WAIT_MS = 55_000;
 
     /** Этапы входа YouDo: SmartCaptcha (чекбокс / калейдоскоп) и OTP могут чередоваться. */
@@ -89,6 +89,8 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     private final YouDoBrowserGuards browserGuards;
 
     private final YouDoModalLayoutFix modalLayoutFix;
+
+    private final YouDoPostCaptchaSubmit postCaptchaSubmit;
 
     @Value("${parser.autoreply.headless.youdo.com:true}")
     private void setHeadless(boolean headless) {
@@ -114,7 +116,8 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                                 YouDoLoginCaptcha youDoLoginCaptcha,
                                 YouDoSmartCaptchaSupport smartCaptchaSupport,
                                 YouDoBrowserGuards browserGuards,
-                                YouDoModalLayoutFix modalLayoutFix) {
+                                YouDoModalLayoutFix modalLayoutFix,
+                                YouDoPostCaptchaSubmit postCaptchaSubmit) {
         super(assignedProxyService);
         this.otpService = otpService;
         this.youdoTariffChecker = youdoTariffChecker;
@@ -122,6 +125,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         this.smartCaptchaSupport = smartCaptchaSupport;
         this.browserGuards = browserGuards;
         this.modalLayoutFix = modalLayoutFix;
+        this.postCaptchaSubmit = postCaptchaSubmit;
     }
 
     @Override
@@ -143,6 +147,10 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         // Открыть главную страницу
         try {
             safeNavigate(page, "https://youdo.com/");
+            StepResult<Void> proxyBlocked = failIfProxyBlocked(page, creds.login(), "after-home");
+            if (proxyBlocked != null) {
+                return proxyBlocked;
+            }
             log.info("АВТООТВЕТ: {} -> главная страница загружена, пользователь: {}", getSiteName(), creds.login());
         } catch (Exception e) {
             report(Level.WARN,
@@ -193,7 +201,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         YouDoLoginFsmState.log(log, YouDoLoginFsmState.FILL_EMAIL, creds.login(), null);
         // Заполнение email
         try {
-            humanTypeField(page, "input[name='login']", creds.login());
+            postCaptchaSubmit.ensureLoginEmail(page, creds.login());
             log.info("АВТООТВЕТ: {} -> email заполнен: {}", getSiteName(), creds.login());
         } catch (Exception e) {
             report(Level.WARN, log,
@@ -224,8 +232,9 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         otpService.beginOtpWait(SiteName.YOUDO.name(), creds.login());
         YouDoLoginFsmState.log(log, YouDoLoginFsmState.SUBMIT_EMAIL, creds.login(), "нажимаем «Далее»");
         log.info("АВТООТВЕТ: {} -> OTP wait начат, нажимаем «Далее», пользователь: {}", getSiteName(), creds.login());
+        postCaptchaSubmit.resetNextButtonMarkupBaseline(page);
 
-        if (!clickOrFail(page, "button:has-text('Далее')", "Кнопка 'Далее'")) {
+        if (!postCaptchaSubmit.clickLoginModalNext(page, false)) {
             report(Level.WARN, log,
                     "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНА КНОПКА 'Далее', пользователь: " + creds.login(),
                     AutoreplyErrorTypes.BUTTON_NOT_FOUND);
@@ -336,12 +345,15 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                         captureScreenshot(page));
             }
             browserGuards.clickContinueEditingIfPresent(page);
+            StepResult<Void> proxyBlocked = failIfProxyBlocked(page, creds.login(), "login-loop-" + i);
+            if (proxyBlocked != null) {
+                return proxyBlocked;
+            }
             YouDoLoginStage stage = detectYouDoLoginStage(page);
             // Капча может всплыть на любом шаге — приоритет над формой/UNKNOWN.
             if (stage != YouDoLoginStage.SMART_CAPTCHA
                     && stage != YouDoLoginStage.LOGGED_IN
-                    && (smartCaptchaSupport.isLoginCaptchaGate(page)
-                    || smartCaptchaSupport.isSmartCaptchaShellPresent(page))) {
+                    && smartCaptchaSupport.blocksYouDoLoginStage(page)) {
                 YouDoLoginFsmState.log(log, YouDoLoginFsmState.CAPTCHA_GUARD, creds.login(),
                         "перехват: было " + stage + " → SMART_CAPTCHA, kind="
                                 + smartCaptchaSupport.detectCaptchaKind(page));
@@ -366,13 +378,11 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                     }
                     log.info("АВТООТВЕТ: {} -> капча пройдена, resumeYandexSmartCaptchaForForm + dismiss overlay, пользователь: {}",
                             getSiteName(), creds.login());
-                    captchaService.resumeYandexSmartCaptchaForForm(page);
-                    captchaService.dismissSmartCaptchaOverlay(page);
+                    captchaService.prepareYouDoEmailSubmitAfterSmartToken(page);
                     page.waitForTimeout(400);
                     if (otpWaitArmed) {
-                        log.info("АВТООТВЕТ: {} -> otpWaitArmed: tryResumeYouDoEmailSubmitAfterCaptcha, пользователь: {}",
+                        log.info("АВТООТВЕТ: {} -> otpWaitArmed: отправка email после капчи, пользователь: {}",
                                 getSiteName(), creds.login());
-                        tryResumeYouDoEmailSubmitAfterCaptcha(page);
                         StepResult<Void> stuck = handlePostCaptchaEmailSubmit(page, creds, postCaptchaNextClicks);
                         if (stuck != null) {
                             return stuck;
@@ -467,8 +477,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                 case UNKNOWN -> {
                     page.waitForTimeout(700);
                     captchaService.revealYouDoLoginCaptchaIframe(page);
-                    if (smartCaptchaSupport.isLoginCaptchaGate(page)
-                            || smartCaptchaSupport.isSmartCaptchaShellPresent(page)) {
+                    if (smartCaptchaSupport.blocksYouDoLoginStage(page)) {
                         YouDoLoginFsmState.log(log, YouDoLoginFsmState.CAPTCHA_GUARD, creds.login(),
                                 "UNKNOWN → shell/gate, ждём 2Captcha");
                         captchaService.waitForYandexSmartCaptchaWidget(page, 12_000);
@@ -536,7 +545,10 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         if (isYouDoEmailSubmitLoading(page)) {
             log.info("АВТООТВЕТ: {} -> капча снята, ждём завершение запроса email, пользователь: {}",
                     getSiteName(), creds.login());
+            postCaptchaSubmit.logNextButtonMarkup(page, "submit-loading-start");
+            postCaptchaSubmit.watchNextButtonWhileLoading(page, "submit", YOUDO_POST_SUBMIT_WAIT_MS);
             waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
+            postCaptchaSubmit.logNextButtonMarkup(page, "submit-loading-end");
             if (isOtpFieldVisible(page) || isYouDoLoggedIn(page)) {
                 return null;
             }
@@ -546,7 +558,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                 captchaService.resumeYandexSmartCaptchaForForm(page);
                 captchaService.dismissSmartCaptchaOverlay(page);
                 page.waitForTimeout(600);
-                tryResumeYouDoEmailSubmitAfterCaptcha(page);
+                tryResumeYouDoEmailSubmitAfterCaptcha(page, creds.login());
                 waitForYouDoLoginProgress(page, 28_000);
             }
             if (isYouDoEmailSubmitLoading(page) && hasYouDoSmartTokenForSubmit(page)) {
@@ -573,9 +585,8 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         postCaptchaNextClicks[0]++;
         log.info("АВТООТВЕТ: {} -> postCaptcha: «Далее» с токеном ({}/{}), пользователь: {}",
                 getSiteName(), postCaptchaNextClicks[0], YOUDO_POST_CAPTCHA_NEXT_MAX, creds.login());
-        if (clickYouDoNextButton(page)) {
+        if (postCaptchaSubmit.submitEmailAfterSmartToken(page, creds.login())) {
             waitAfterYouDoNextClick(page);
-            triggerYouDoEmailFormSubmit(page);
             waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
         } else {
             forceClickYouDoNextAfterCaptcha(page);
@@ -589,29 +600,13 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     }
 
     /** Сброс зависшего спиннера и повтор «Далее» после внешнего smart-token. */
-    private void tryResumeYouDoEmailSubmitAfterCaptcha(Page page) {
+    private void tryResumeYouDoEmailSubmitAfterCaptcha(Page page, String loginEmail) {
         if (page == null || page.isClosed()) {
             return;
         }
         captchaService.resumeYandexSmartCaptchaForForm(page);
         captchaService.dismissSmartCaptchaOverlay(page);
-        try {
-            page.evaluate(
-                    """
-                            () => {
-                              for (const b of document.querySelectorAll('button')) {
-                                if (b.offsetParent === null) continue;
-                                const text = (b.textContent || '').trim();
-                                if (!text.includes('Далее')) continue;
-                                b.disabled = false;
-                                b.removeAttribute('aria-busy');
-                                b.classList.remove('disabled');
-                              }
-                            }
-                            """);
-        } catch (Exception e) {
-            log.debug("АВТООТВЕТ: {} -> сброс спиннера «Далее»: {}", getSiteName(), e.getMessage());
-        }
+        postCaptchaSubmit.ensureLoginEmail(page, loginEmail);
         if (!isYouDoEmailSubmitLoading(page) && isYouDoNextButtonClickable(page)) {
             clickYouDoNextButton(page);
             waitAfterYouDoNextClick(page);
@@ -623,8 +618,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             return;
         }
         if (hasYouDoSmartTokenForSubmit(page)) {
-            forceClickYouDoNextAfterCaptcha(page);
-            triggerYouDoEmailFormSubmit(page);
+            postCaptchaSubmit.submitEmailAfterSmartToken(page, loginEmail);
         }
     }
 
@@ -683,12 +677,10 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             log.debug("АВТООТВЕТ: {} -> сброс спиннера force «Далее»: {}", getSiteName(), e.getMessage());
         }
         try {
-            Locator next = page.locator("button:has-text('Далее')").first();
-            if (next.count() > 0 && next.isVisible()) {
-                clickLocatorForceIfNeeded(page, next);
+            if (postCaptchaSubmit.clickLoginModalNext(page, true)) {
                 log.info("АВТООТВЕТ: {} -> force-клик «Далее» после капчи", getSiteName());
                 waitAfterYouDoNextClick(page);
-                triggerYouDoEmailFormSubmit(page);
+                postCaptchaSubmit.triggerEmailFormSubmit(page);
             }
         } catch (Exception e) {
             log.debug("АВТООТВЕТ: {} -> force «Далее» не удался: {}", getSiteName(), e.getMessage());
@@ -716,19 +708,29 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     }
 
     private boolean clickYouDoNextButton(Page page) {
+        if (hasYouDoSmartTokenForSubmit(page)) {
+            captchaService.prepareYouDoEmailSubmitAfterSmartToken(page);
+            return postCaptchaSubmit.clickLoginModalNext(page, true);
+        }
         if (isYouDoEmailSubmitLoading(page)) {
             return false;
         }
-        return clickOrFail(page, "button:has-text('Далее')", "Кнопка 'Далее' после капчи");
+        return postCaptchaSubmit.clickLoginModalNext(page, false);
     }
 
     private boolean isYouDoNextButtonClickable(Page page) {
-        if (page == null || page.isClosed() || isYouDoEmailSubmitLoading(page)) {
+        if (page == null || page.isClosed()) {
+            return false;
+        }
+        if (hasYouDoSmartTokenForSubmit(page)) {
+            return postCaptchaSubmit.locateNextButton(page) != null;
+        }
+        if (isYouDoEmailSubmitLoading(page)) {
             return false;
         }
         try {
-            Locator next = page.locator("button:has-text('Далее')").first();
-            return next.count() > 0 && next.isVisible() && next.isEnabled();
+            Locator next = postCaptchaSubmit.locateNextButton(page);
+            return next != null && next.isEnabled();
         } catch (Exception e) {
             return false;
         }
@@ -820,7 +822,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     private void logFsmStage(YouDoLoginStage stage, String login, int iteration) {
         YouDoLoginFsmState fsm = switch (stage) {
             case SMART_CAPTCHA -> YouDoLoginFsmState.CAPTCHA_GUARD;
-            case EMAIL_FORM -> YouDoLoginFsmState.POST_CAPTCHA_SUBMIT;
+            case EMAIL_FORM -> YouDoLoginFsmState.SUBMIT_EMAIL;
             case OTP_CODE -> YouDoLoginFsmState.WAIT_OTP;
             case LOGGED_IN -> YouDoLoginFsmState.DONE;
             case EMAIL_ERROR, UNKNOWN -> YouDoLoginFsmState.CAPTCHA_GUARD;
@@ -850,12 +852,26 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         try {
             String current = page.locator("input[name='login']").first().inputValue();
             if (current == null || current.isBlank() || !current.equals(creds.login())) {
-                humanTypeField(page, "input[name='login']", creds.login());
+                postCaptchaSubmit.ensureLoginEmail(page, creds.login());
                 log.info("АВТООТВЕТ: {} -> email повторно заполнен: {}", getSiteName(), creds.login());
             }
         } catch (Exception e) {
             log.debug("АВТООТВЕТ: {} -> не удалось повторно заполнить email: {}", getSiteName(), e.getMessage());
         }
+    }
+
+    private StepResult<Void> failIfProxyBlocked(Page page, String login, String phase) {
+        if (!YouDoPlaywrightGuards.isProxyBlockedPage(page)) {
+            return null;
+        }
+        String details = YouDoPlaywrightGuards.formatBlockDetails(page);
+        YouDoLoginFsmState.log(log, YouDoLoginFsmState.PROXY_BLOCKED, login, phase + " " + details);
+        String message = YouDoPlaywrightGuards.proxyBlockedFailMessage(getSiteName(), details);
+        report(Level.WARN, log,
+                "АВТООТВЕТ: " + getSiteName() + " -> " + message + ", пользователь: " + login,
+                AutoreplyErrorTypes.ERROR_OPEN_PAGE);
+        return StepResult.fail(StepType.SEND_AUTOREPLY, YouDoPlaywrightGuards.YOUDO_PROXY_BLOCKED_CODE,
+                message, captureScreenshot(page));
     }
 
     private StepResult<Void> failYouDoEmailSubmitStuck(Page page, String login) {
@@ -873,8 +889,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         if (page == null || page.isClosed()) {
             return YouDoLoginStage.UNKNOWN;
         }
-        if (smartCaptchaSupport.isLoginCaptchaGate(page)
-                || smartCaptchaSupport.isSmartCaptchaShellPresent(page)) {
+        if (smartCaptchaSupport.blocksYouDoLoginStage(page)) {
             return YouDoLoginStage.SMART_CAPTCHA;
         }
         if (isEmailErrorPresent(page)) {
@@ -1449,6 +1464,10 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             log.info("АВТООТВЕТ: {} -> тариф активен, продолжаем обработку заказа", getSiteName());
             page.navigate(link);
             page.waitForLoadState(LoadState.NETWORKIDLE);
+            StepResult<Void> proxyBlocked = failIfProxyBlocked(page, login, "order-page");
+            if (proxyBlocked != null) {
+                return proxyBlocked;
+            }
             log.info("АВТООТВЕТ: {} -> страница заказа открыта, пользователь: {}", getSiteName(), login);
             humanWarmupYouDo(page);
             takeScreenshot(page, getSiteName(), payload.getUser().getUuid(), "order_page");
@@ -1550,6 +1569,10 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     private StepResult<Void> checkTariff(Page page, String login){
         page.navigate(getProfileUrl(page));
         page.waitForLoadState(LoadState.NETWORKIDLE);
+        StepResult<Void> proxyBlocked = failIfProxyBlocked(page, login, "profile-tariff");
+        if (proxyBlocked != null) {
+            return proxyBlocked;
+        }
         log.info("АВТООТВЕТ: {} -> страница профиля открыта, пользователь: {}", getSiteName(), login);
         boolean isTariffTab = youdoTariffChecker.isTariffsTabPresent(page);
         if (!isTariffTab) {

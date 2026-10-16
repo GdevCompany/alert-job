@@ -14,11 +14,15 @@ public class YouDoLoginCaptcha {
 
     private final CaptchaService captchaService;
 
+    private final YouDoLoginApiListener loginApiListener;
+
     public void beginNetworkCapture(Page page) {
         captchaService.beginKaleidoscopeNetworkCapture(page);
+        loginApiListener.begin(page);
     }
 
     public void endNetworkCapture(Page page) {
         captchaService.endKaleidoscopeNetworkCapture(page);
+        loginApiListener.end(page);
     }
 }

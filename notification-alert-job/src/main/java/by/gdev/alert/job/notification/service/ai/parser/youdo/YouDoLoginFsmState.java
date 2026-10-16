@@ -8,6 +8,7 @@ import org.slf4j.Logger;
 public enum YouDoLoginFsmState {
 
     NAVIGATE_HOME("Открытие youdo.com"),
+    PROXY_BLOCKED("403: прокси/IP заблокирован защитой"),
     DISMISS_COOKIES("Снятие cookie-баннера"),
     OPEN_LOGIN_MODAL("Модалка «Войти»"),
     CHOOSE_EMAIL("Вход через email"),

@@ -3,6 +3,7 @@ package by.gdev.alert.job.notification.service.ai.sessions.impl;
 import by.gdev.alert.job.notification.model.dto.DecryptedCredential;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
+import by.gdev.alert.job.notification.service.ai.parser.youdo.YouDoPlaywrightGuards;
 import by.gdev.alert.job.notification.service.ai.sessions.AbstractAutoreplySessionVerifier;
 import by.gdev.common.model.SiteName;
 import com.microsoft.playwright.BrowserContext;
@@ -54,6 +55,11 @@ public class YouDoSessionVerifier extends AbstractAutoreplySessionVerifier {
             }
             safeNavigate(page, "https://youdo.com/");
             page.waitForTimeout(2000);
+            if (YouDoPlaywrightGuards.isProxyBlockedPage(page)) {
+                String details = YouDoPlaywrightGuards.formatBlockDetails(page);
+                return StepResult.fail(StepType.SEND_AUTOREPLY, YouDoPlaywrightGuards.YOUDO_PROXY_BLOCKED_CODE,
+                        YouDoPlaywrightGuards.proxyBlockedFailMessage(getSiteName(), details));
+            }
             for (String selector : LOGIN_BUTTON_SELECTORS) {
                 try {
                     Locator btn = page.locator(selector);
