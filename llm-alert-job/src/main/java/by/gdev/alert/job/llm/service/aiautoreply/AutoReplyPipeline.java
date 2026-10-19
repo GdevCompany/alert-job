@@ -2,6 +2,8 @@ package by.gdev.alert.job.llm.service.aiautoreply;
 
 import by.gdev.alert.job.llm.domain.dto.AiDecision;
 import by.gdev.alert.job.llm.domain.dto.order.AiOrderRequest;
+import by.gdev.alert.job.llm.domain.dto.order.AiOrderRequestBase;
+import by.gdev.alert.job.llm.domain.dto.order.AiOrderRequestTest;
 import by.gdev.alert.job.llm.domain.dto.order.OrderDTO;
 import by.gdev.alert.job.llm.service.aiautoreply.analysis.AiOrderAnalysisService;
 import by.gdev.alert.job.llm.service.aiautoreply.sender.DummyReplySender;
@@ -97,48 +99,61 @@ public class AutoReplyPipeline {
      */
     public void process(AiOrderRequest request) {
         llmUserService.saveUser(request.getUser());
-        String uuid = request.getUser().getUuid();
-
-        for (OrderDTO order : request.getOrders()) {
-            String key = order.getLink();
-
-            if (!sent.add(key)) {
-                continue;
-            }
-
-            AiDecision decision = processItem(order, request.getTemplateId(), request.getPromtId(), uuid);
-            String reply = null;
-            if (decision.isValid()) {
-                reply = finalizeReply(decision);
-            }
-
-            if (reply != null && !reply.trim().isEmpty() && decision.isValid()) {
-                getDummyReplySender().send(order, reply, decision);
-                getNotificationyReplySender()
-                        .sendToNotificationService(order, request.getUser(), request.getModule(),
-                                decision, request.getCredentialId(), request.getNotificationType());
-            }
-
+        if (request.getOrders() == null) {
+            return;
         }
+        for (OrderDTO order : request.getOrders()) {
+            processOne(request, order, null);
+        }
+    }
+
+    public void process(AiOrderRequestTest request, String llmReply) {
+        llmUserService.saveUser(request.getUser());
+        processOne(request, request.getOrder(), llmReply);
+    }
+
+    private void processOne(AiOrderRequestBase context, OrderDTO order, String llmReply) {
+        String uuid = context.getUser().getUuid();
+        if (!sent.add(order.getLink())) {
+            return;
+        }
+
+        AiDecision decision = processItem(
+                order, context.getTemplateId(), context.getPromtId(), uuid, llmReply);
+
+        if (!decision.isValid()) {
+            return;
+        }
+        String reply = finalizeReply(decision);
+        if (reply == null || reply.trim().isEmpty()) {
+            return;
+        }
+
+        getDummyReplySender().send(order, reply, decision);
+        getNotificationyReplySender().sendToNotificationService(
+                order, context.getUser(), context.getModule(),
+                decision, context.getCredentialId(), context.getNotificationType());
     }
 
     /**
      * Выполняет анализ одного заказа с учётом контекста.
      */
-    private AiDecision processItem(OrderDTO order, Long templateId, Long promtId, String uuid) {
-        log.info("""
+    private AiDecision processItem(OrderDTO order, Long templateId, Long promtId, String uuid, String llmReply) {
+        if (llmReply == null) {
+            log.info("""
 [LLM] Начат анализ заказа:
   link: {}
   title: {}
   templateId: {}
   promtId: {}
 """,
-                order.getLink(),
-                order.getTitle(),
-                templateId,
-                promtId
-        );
-        return analysisService.analyze(order, templateId, promtId, uuid);
+                    order.getLink(),
+                    order.getTitle(),
+                    templateId,
+                    promtId
+            );
+        }
+        return analysisService.analyze(order, templateId, promtId, uuid, llmReply);
     }
 
     /**

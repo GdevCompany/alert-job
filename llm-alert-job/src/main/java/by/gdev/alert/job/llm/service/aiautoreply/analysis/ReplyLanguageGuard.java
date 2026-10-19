@@ -2,8 +2,6 @@ package by.gdev.alert.job.llm.service.aiautoreply.analysis;
 
 import by.gdev.common.util.ReplyTextNormalizer;
 
-import java.util.regex.Pattern;
-
 /**
  * Чистит текст автоответа от «чужих» иероглифов перед отправкой на биржу.
  * <p>
@@ -20,10 +18,6 @@ import java.util.regex.Pattern;
  * Если заказ в основном на китайском, японском или корейском — ответ не режем.
  */
 public final class ReplyLanguageGuard {
-
-    /** Китайские / японские / корейские символы (см. javadoc класса). */
-    private static final Pattern CJK =
-            Pattern.compile("[\\p{Script=Han}\\p{Script=Hiragana}\\p{Script=Katakana}\\p{Script=Hangul}]+");
 
     private ReplyLanguageGuard() {
     }
@@ -59,14 +53,50 @@ public final class ReplyLanguageGuard {
     }
 
     /**
-     * Удаляет из строки китайские, японские и корейские знаки (CJK), подчищает лишние пробелы.
+     * Удаляет из строки CJK-знаки и CJK-пунктуацию, подчищает лишние пробелы.
      */
     public static String stripCjk(String text) {
         if (text == null || text.isEmpty()) {
             return text;
         }
-        String withoutCjk = CJK.matcher(text).replaceAll("");
+        StringBuilder sb = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            if (!shouldStripCodePoint(cp)) {
+                sb.appendCodePoint(cp);
+            }
+            i += Character.charCount(cp);
+        }
+        String withoutCjk = sb.toString();
         return withoutCjk.replaceAll("[ \\t]{2,}", " ").replaceAll(" *([,.;:!?])", "$1").trim();
+    }
+
+    private static boolean shouldStripCodePoint(int cp) {
+        if (isCjkPunctuation(cp)) {
+            return true;
+        }
+        Character.UnicodeScript script = Character.UnicodeScript.of(cp);
+        return script == Character.UnicodeScript.HAN
+                || script == Character.UnicodeScript.HIRAGANA
+                || script == Character.UnicodeScript.KATAKANA
+                || script == Character.UnicodeScript.HANGUL;
+    }
+
+    /** CJK-пунктуация и fullwidth-знаки, не попадающие в {@code Script=Han}. */
+    private static boolean isCjkPunctuation(int cp) {
+        if (cp >= 0x3000 && cp <= 0x303F) {
+            return true;
+        }
+        if (cp >= 0xFF01 && cp <= 0xFF0F) {
+            return true;
+        }
+        if (cp >= 0xFF1A && cp <= 0xFF1F) {
+            return true;
+        }
+        if (cp >= 0xFF3B && cp <= 0xFF40) {
+            return true;
+        }
+        return cp >= 0xFF5B && cp <= 0xFF65;
     }
 
     /**

@@ -100,9 +100,11 @@ public class AiOrderAnalysisService {
      *     <li>подставляет сгенерированный текст в HTML‑шаблон.</li>
      * </ul>
      *
+     * @param llmReply если не {@code null} — не вызывать LLM; взять этот текст как готовый ответ
+     *                 (без повторной склейки с шаблоном), применить только нормализацию и {@link ReplyLanguageGuard}
      * @return решение AI с текстом ответа
      */
-    public AiDecision analyze(OrderDTO order, Long templateId, Long promtId, String uuid){
+    public AiDecision analyze(OrderDTO order, Long templateId, Long promtId, String uuid, String llmReply) {
 
         String orderTitle = order.getTitle();
         String orderContent = order.getMessage();
@@ -113,24 +115,25 @@ public class AiOrderAnalysisService {
         String orderDate = order.getDateTime() != null ? order.getDateTime().toString() : "не указана";
         List<String> keywords = List.of();
 
+        // Загружаем шаблон письма
+        String replyTemplate;
+        if (templateId != null) {
+            AiReplyTemplate t = templateService.getTemplateById(uuid, templateId);
+            replyTemplate = t.getText();
+        } else {
+            AiReplyTemplate t = templateService.getDefaultTemplate();
+            replyTemplate = t.getText();
+        }
+
+        if (llmReply != null) {
+            return editDecision(new AiDecision(llmReply, "", true), order, replyTemplate, true);
+        }
+
         AiPromptDto promptEntity = aiPromptService.getPromptByIdOrDefault(uuid, promtId);
         String promptText = promptEntity.getText();
         String safePromptText = promptText.replace(AUTO_GENERATED_PLACEHOLDER,
                 LlmConstants.ESCAPED_AUTO_GENERATED_PLACEHOLDER
         );
-
-            // Загружаем шаблон письма
-            String replyTemplate;
-            if (templateId != null) {
-                AiReplyTemplate t = templateService.getTemplateById(uuid, templateId);
-                replyTemplate = t.getText();
-            } else {
-                // DEFAULT TEMPLATE
-                AiReplyTemplate t = templateService.getDefaultTemplate();
-                replyTemplate = t.getText();
-            }
-
-        // Экранируем проблемный фрагмент
 
         // Формируем prompt
         String prompt;
@@ -215,13 +218,7 @@ public class AiOrderAnalysisService {
                         .trim();
                 String json = extractJson(raw);
                 AiDecision decision = mapper.readValue(json, AiDecision.class);
-                String reply = ReplyTextNormalizer.normalize(decision.getReply());
-                String replyBeforeLang = reply;
-                reply = ReplyLanguageGuard.alignReplyWithOrderLanguage(reply, orderTitle, orderContent);
-                if (reply != null && replyBeforeLang != null && !reply.equals(replyBeforeLang)) {
-                    log.warn("Из ответа LLM убраны чужие CJK-вставки (заказ не на китайском/японском/корейском): {}", orderLink);
-                }
-                decision.setReply(reply);
+                decision.setReply(ReplyTextNormalizer.normalize(decision.getReply()));
                 decision.setPrefix(ReplyTextNormalizer.normalize(decision.getPrefix()));
                 decision.setValid(true);
                 log.info("""
@@ -258,23 +255,38 @@ public class AiOrderAnalysisService {
         });
 
         try {
-            AiDecision decision = future.get();
-            // ВСТАВЛЯЕМ СГЕНЕРИРОВАННЫЙ ТЕКСТ ПОСЛЕ ПРИВЕТСТВИЯ
-            if (decision.getReply() != null && !decision.getReply().isEmpty()) {
-                String finalReply = buildFinalReply(replyTemplate, decision.getReply(), decision.getPrefix());
-                finalReply = ReplyTextNormalizer.normalize(finalReply);
-                finalReply = ReplyLanguageGuard.alignReplyWithOrderLanguage(finalReply, orderTitle, orderContent);
-                decision.setReply(finalReply);
-            }
-            return decision;
+            return editDecision(future.get(), order, replyTemplate);
         } catch (Exception e) {
             log.error("Executor error", e);
-
             return new AiDecision(
                     "Executor error: " + e.getMessage(),
                     "", false
             );
         }
+    }
+
+    private AiDecision editDecision(AiDecision decision, OrderDTO order, String replyTemplate) {
+        return editDecision(decision, order, replyTemplate, false);
+    }
+
+    private AiDecision editDecision(
+            AiDecision decision, OrderDTO order, String replyTemplate, boolean skipTemplateMerge) {
+        if (decision.getReply() != null && !decision.getReply().isEmpty()) {
+            String generated = ReplyTextNormalizer.normalize(decision.getReply());
+            String beforeGuard = generated;
+            generated = ReplyLanguageGuard.alignReplyWithOrderLanguage(
+                    generated, order.getTitle(), order.getMessage());
+            if (!generated.equals(beforeGuard)) {
+                log.warn(
+                        "Из ответа LLM убраны чужие CJK-вставки (заказ не на китайском/японском/корейском): {}",
+                        order.getLink());
+            }
+            String finalReply = skipTemplateMerge
+                    ? generated
+                    : buildFinalReply(replyTemplate, generated, decision.getPrefix());
+            decision.setReply(ReplyTextNormalizer.normalize(finalReply));
+        }
+        return decision;
     }
 
     /**

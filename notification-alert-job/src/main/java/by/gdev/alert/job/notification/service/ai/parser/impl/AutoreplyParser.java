@@ -121,18 +121,16 @@ public abstract class AutoreplyParser {
     }
 
     protected void prepareNextAutoreplyProxyAttempt(AiNotificationPayload payload, int nextAttempt) {
-        ProxyRetryState state = PROXY_RETRY_STATE.get();
-        ProxyCredentials next;
-        if (proxy) {
-            next = assignedProxyService.rotateProxyForUserModule(
-                    payload.getUser().getUuid(),
-                    payload.getModule().getId(),
-                    getSiteName(),
-                    state.lastUsed,
-                    state.triedHostPorts);
-        } else {
-            next = assignedProxyService.pickWorkingProxyExcluding(getSiteName(), state.triedHostPorts);
+        if (!proxy) {
+            return;
         }
+        ProxyRetryState state = PROXY_RETRY_STATE.get();
+        ProxyCredentials next = assignedProxyService.rotateProxyForUserModule(
+                payload.getUser().getUuid(),
+                payload.getModule().getId(),
+                getSiteName(),
+                state.lastUsed,
+                state.triedHostPorts);
         state.overrideProxy = next;
         if (next == null) {
             log.warn("АВТООТВЕТ: {} -> нет другого прокси для попытки {}", getSiteName(), nextAttempt);
@@ -157,13 +155,16 @@ public abstract class AutoreplyParser {
 
         while (true) {
             run++;
-            last = AutoreplyProxyFailures.tagProxyFailure(runAutoreplyOnce(creds, payload, autoreplyMode));
+            last = runAutoreplyOnce(creds, payload, autoreplyMode);
+            if (last.failed() && proxy) {
+                last = AutoreplyProxyFailures.tagProxyFailure(last);
+            }
             if (!last.failed()) {
                 return last;
             }
 
             AutoreplyFailureAction action = resolveFailureAction(last);
-            boolean proxyFailure = AutoreplyProxyFailures.isProxyRelated(last);
+            boolean proxyFailure = proxy && AutoreplyProxyFailures.isProxyRelated(last);
             ProxyCredentials usedProxy = PROXY_RETRY_STATE.get().lastUsed;
             String proxyLabel = usedProxy != null
                     ? usedProxy.getHost() + ":" + usedProxy.getPort()
@@ -572,7 +573,7 @@ public abstract class AutoreplyParser {
     protected BrowserLaunchOptions buildLaunchOptions(SiteName site, AiNotificationPayload payload) {
         ProxyRetryState state = PROXY_RETRY_STATE.get();
         String userEmail = payload.getUser() != null ? payload.getUser().getEmail() : null;
-        if (state.overrideProxy != null) {
+        if (proxy && state.overrideProxy != null) {
             state.lastUsed = state.overrideProxy;
             state.triedHostPorts.add(AssignedProxyService.hostPortKey(state.lastUsed));
             state.overrideProxy = null;
@@ -584,7 +585,6 @@ public abstract class AutoreplyParser {
             return new BrowserLaunchOptions(state.lastUsed, headless, true, userEmail);
         }
         if (!proxy) {
-            // даже при proxy=false recovery может подставить прокси на повторной попытке
             BrowserLaunchOptions options = new BrowserLaunchOptions(null, headless, false, userEmail);
             state.lastUsed = null;
             if (captchaService != null) {
