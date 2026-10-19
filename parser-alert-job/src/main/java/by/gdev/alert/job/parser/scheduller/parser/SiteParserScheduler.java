@@ -4,6 +4,7 @@ import by.gdev.alert.job.parser.scheduller.parser.properties.ParserSchedulePrope
 import by.gdev.alert.job.parser.service.order.SiteParser;
 import by.gdev.common.model.OrderDTO;
 import by.gdev.common.service.proxy.ProxyCheckGate;
+import by.gdev.common.util.DurationFormatter;
 import com.microsoft.playwright.PlaywrightException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.TaskScheduler;
@@ -52,7 +53,7 @@ public class SiteParserScheduler {
             long startTime = System.currentTimeMillis();
             List<OrderDTO> orders = parser.parse();
             long duration = System.currentTimeMillis() - startTime;
-            String formattedDuration = formatDuration(duration);
+            String formattedDuration = DurationFormatter.formatDuration(duration);
             dispatcher.dispatch(orders, parser.getSiteName());
             log.debug("Парсер {} завершил работу за {}, найдено {} заказов",
                     parser.getSiteName(), formattedDuration, orders.size());
@@ -66,18 +67,6 @@ public class SiteParserScheduler {
         }
         catch (Exception e) {
             log.error("Ошибка парсера {}: {}", parser.getSiteName(), e.getMessage(), e);
-        }
-    }
-
-    private String formatDuration(long millis) {
-        if (millis < 1000) {
-            return millis + " мс";
-        } else if (millis < 60000) {
-            return String.format("%.2f сек", millis / 1000.0);
-        } else {
-            long minutes = millis / 60000;
-            long seconds = (millis % 60000) / 1000;
-            return String.format("%d мин %d сек", minutes, seconds);
         }
     }
 }

@@ -4,6 +4,7 @@ import by.gdev.common.model.proxy.ProxyCredentials;
 import by.gdev.common.model.proxy.ProxyState;
 import by.gdev.common.service.proxy.event.ProxyListUpdatedEvent;
 import by.gdev.common.service.proxy.supplier.ProxySupplier;
+import by.gdev.common.util.DurationFormatter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -76,7 +77,7 @@ public class ProxyUpdateScheduler {
                 .filter(p -> p.getState() == ProxyState.ACTIVE || p.getState() == ProxyState.WARMING_UP)
                 .count();
         log.info("Прокси (сводка после обновления SUPPLIER): за {}, рабочих {}/{}, активных {}, всего {}",
-                ProxyCheckerService.formatCheckDuration(summary.elapsedMs()),
+                DurationFormatter.formatDuration(summary.elapsedMs()),
                 summary.working(), summary.total(), active, summary.total());
         eventPublisher.publishEvent(new ProxyListUpdatedEvent(this, proxySupplier.getProxies()));
     }
