@@ -4,6 +4,7 @@ import by.gdev.common.model.proxy.ProxyCredentials;
 import by.gdev.common.model.proxy.ProxyState;
 import by.gdev.common.service.proxy.event.ProxyListUpdatedEvent;
 import by.gdev.common.service.proxy.supplier.ProxySupplier;
+import by.gdev.common.util.DurationFormatter;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -31,40 +32,52 @@ public class ProxyCheckerScheduler {
 
     @PostConstruct
     public void init() {
-        run();
+        run(true);
     }
 
     @Scheduled(cron = "0 */30 * * * *")
-    public void run() {
-        log.info("Запуск обновления и проверки прокси...");
+    public void runScheduled() {
+        run(false);
+    }
 
-        // Получаем API-прокси
+    private void run(boolean verbose) {
+        if (verbose) {
+            log.info("Запуск обновления и проверки прокси (первый прогон, подробные логи)...");
+        } else {
+            log.info("Плановая проверка прокси (только сводка)...");
+        }
+
         List<ProxyCredentials> apiProxies = proxyAdditionalService.fetchProxies();
-        log.info("API-прокси: {}", apiProxies.size());
+        if (verbose) {
+            log.info("API-прокси: {}", apiProxies.size());
+        }
 
-        // Добавляем их в supplier (заменяет старые API-прокси)
         if (!apiProxies.isEmpty()) {
             proxySupplier.addApiProxies(apiProxies);
         }
 
-        // Получаем весь объединённый список
         List<ProxyCredentials> allProxies = proxySupplier.getProxies();
-        log.info("Всего прокси после добавления API: {}", allProxies.size());
+        if (verbose) {
+            log.info("Всего прокси после добавления API: {}", allProxies.size());
+        }
 
-        // Проверяем все прокси
-        proxyCheckerService.checkProxies(allProxies, countryFilterEnabled);
-        log.info("Проверка завершена.");
+        ProxyCheckerService.ProxyCheckSummary summary =
+                proxyCheckerService.checkProxies(allProxies, countryFilterEnabled, verbose);
 
-        // Логируем распределение по странам
-        logCountryDistribution(allProxies);
-
-        // Считаем активные
         long active = allProxies.stream()
                 .filter(p -> p.getState() == ProxyState.ACTIVE || p.getState() == ProxyState.WARMING_UP)
                 .count();
         eventPublisher.publishEvent(new ProxyListUpdatedEvent(this, allProxies));
-        log.info("Активных: {}", active);
-        log.info("Готово. Всего: {}", allProxies.size());
+
+        if (verbose) {
+            logCountryDistribution(allProxies);
+            log.info("Проверка завершена. Активных: {}", active);
+            log.info("Готово. Всего: {}", allProxies.size());
+        } else {
+            log.info("Прокси (сводка): за {}, рабочих {}/{}, активных {}, всего {}",
+                    DurationFormatter.formatDuration(summary.elapsedMs()),
+                    summary.working(), summary.total(), active, allProxies.size());
+        }
     }
 
     private void logCountryDistribution(List<ProxyCredentials> proxies) {

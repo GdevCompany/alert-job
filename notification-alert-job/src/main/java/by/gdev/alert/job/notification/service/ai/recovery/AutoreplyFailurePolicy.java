@@ -6,8 +6,9 @@ import by.gdev.common.service.playwright.captcha.failure.CaptchaFailureCode;
 import by.gdev.common.service.playwright.flru.FlRuPlaywrightGuards;
 
 /**
- * Политика recovery по {@code errorCode} / тексту ошибки:
- * {@link AutoreplyFailureAction#ROTATE_PROXY}, {@link AutoreplyFailureAction#RETRY_SAME}, {@link AutoreplyFailureAction#ABORT}.
+ * Политика recovery: {@link AutoreplyFailureAction#ABORT} или {@link AutoreplyFailureAction#RETRY_SAME}.
+ * Смена прокси не здесь — в {@link by.gdev.alert.job.notification.service.ai.parser.impl.AutoreplyParser}
+ * после {@code parser.autoreply.proxy.attempts-per-proxy} неудач на одном IP.
  */
 public final class AutoreplyFailurePolicy {
 
@@ -23,10 +24,12 @@ public final class AutoreplyFailurePolicy {
 
     public static AutoreplyFailureAction resolve(String errorCode, String message) {
         if (message != null && message.contains(FlRuPlaywrightGuards.DDOS_RETRY_FAIL_MARKER)) {
-            return AutoreplyFailureAction.ROTATE_PROXY;
+            return AutoreplyFailureAction.RETRY_SAME;
         }
         if (errorCode == null || errorCode.isBlank()) {
-            return AutoreplyFailureAction.ABORT;
+            return AutoreplyProxyFailures.isProxyRelated(null, message)
+                    ? AutoreplyFailureAction.RETRY_SAME
+                    : AutoreplyFailureAction.ABORT;
         }
 
         try {
@@ -38,8 +41,8 @@ public final class AutoreplyFailurePolicy {
                      FLRU_VALIDATE_YANDEX,
                      FLRU_VALIDATE_UNKNOWN,
                      FLRU_LOGIN_YANDEX_ADVANCED,
-                     FLRU_LOGIN_YANDEX_UNKNOWN -> AutoreplyFailureAction.ROTATE_PROXY;
-                case FLRU_LOGIN_YANDEX_CHECKBOX,
+                     FLRU_LOGIN_YANDEX_UNKNOWN,
+                     FLRU_LOGIN_YANDEX_CHECKBOX,
                      CAPTCHA_GENERIC,
                      CAPTCHA_EXCEPTION -> AutoreplyFailureAction.RETRY_SAME;
                 default -> AutoreplyFailureAction.ABORT;
@@ -49,9 +52,10 @@ public final class AutoreplyFailurePolicy {
         }
 
         return switch (errorCode) {
-            case AutoreplyErrorTypes.CAPTCHA_FAILED,
+            case AutoreplyErrorTypes.PROXY_FAILED,
+                 AutoreplyErrorTypes.CAPTCHA_FAILED,
                  AutoreplyErrorTypes.TIMEOUT,
-                 AutoreplyErrorTypes.ERROR_OPEN_PAGE -> AutoreplyFailureAction.ROTATE_PROXY;
+                 AutoreplyErrorTypes.ERROR_OPEN_PAGE -> AutoreplyFailureAction.RETRY_SAME;
             case AutoreplyErrorTypes.LOGIN_FAILED,
                  AutoreplyErrorTypes.OTP_NOT_RECEIVED,
                  AutoreplyErrorTypes.FIELD_NOT_FOUND,
@@ -61,7 +65,7 @@ public final class AutoreplyFailurePolicy {
                  AutoreplyErrorTypes.ORDER_EXECUTOR_SELECTED,
                  AutoreplyErrorTypes.SITE_MAINTENANCE,
                  AutoreplyErrorTypes.EMAIL_CODE_LOGIN_ENABLED -> AutoreplyFailureAction.ABORT;
-            default -> AutoreplyFailureAction.ABORT;
+            default -> AutoreplyFailureAction.RETRY_SAME;
         };
     }
 }

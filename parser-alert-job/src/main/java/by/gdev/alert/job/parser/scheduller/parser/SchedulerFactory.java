@@ -5,6 +5,7 @@ import by.gdev.alert.job.parser.scheduller.parser.properties.ParserScheduleConfi
 import by.gdev.alert.job.parser.scheduller.parser.properties.ParserScheduleProperties;
 import by.gdev.alert.job.parser.service.order.SiteParser;
 import by.gdev.common.model.SiteName;
+import by.gdev.common.service.proxy.ProxyCheckGate;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -24,6 +25,7 @@ public class SchedulerFactory {
     private final OrderDispatcher dispatcher;
     private final ParserScheduleConfig scheduleConfig;
     private final SiteParserSchedulerBeanRegistrar siteParserSchedulerBeanRegistrar;
+    private final ProxyCheckGate proxyCheckGate;
 
     @Value("${parsers.singlethread:false}")
     private boolean singlethread;
@@ -64,7 +66,8 @@ public class SchedulerFactory {
                         parser,
                         dispatcher,
                         parserScheduleProperties,
-                        individualScheduler
+                        individualScheduler,
+                        proxyCheckGate
                 );
 
                 String beanName = siteName.name().toLowerCase() + SiteParserScheduler.class.getSimpleName();
@@ -85,7 +88,8 @@ public class SchedulerFactory {
                         parser,
                         dispatcher,
                         parserScheduleProperties,
-                        taskScheduler
+                        taskScheduler,
+                        proxyCheckGate
                 );
 
                 String beanName = siteName.name().toLowerCase() + SiteParserScheduler.class.getSimpleName();
