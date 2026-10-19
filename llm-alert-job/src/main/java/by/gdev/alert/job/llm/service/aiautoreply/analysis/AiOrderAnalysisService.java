@@ -215,7 +215,13 @@ public class AiOrderAnalysisService {
                         .trim();
                 String json = extractJson(raw);
                 AiDecision decision = mapper.readValue(json, AiDecision.class);
-                decision.setReply(ReplyTextNormalizer.normalize(decision.getReply()));
+                String reply = ReplyTextNormalizer.normalize(decision.getReply());
+                String replyBeforeLang = reply;
+                reply = ReplyLanguageGuard.alignReplyWithOrderLanguage(reply, orderTitle, orderContent);
+                if (reply != null && replyBeforeLang != null && !reply.equals(replyBeforeLang)) {
+                    log.warn("Из ответа LLM убраны чужие CJK-вставки (заказ не на китайском/японском/корейском): {}", orderLink);
+                }
+                decision.setReply(reply);
                 decision.setPrefix(ReplyTextNormalizer.normalize(decision.getPrefix()));
                 decision.setValid(true);
                 log.info("""
@@ -256,7 +262,9 @@ public class AiOrderAnalysisService {
             // ВСТАВЛЯЕМ СГЕНЕРИРОВАННЫЙ ТЕКСТ ПОСЛЕ ПРИВЕТСТВИЯ
             if (decision.getReply() != null && !decision.getReply().isEmpty()) {
                 String finalReply = buildFinalReply(replyTemplate, decision.getReply(), decision.getPrefix());
-                decision.setReply(ReplyTextNormalizer.normalize(finalReply));
+                finalReply = ReplyTextNormalizer.normalize(finalReply);
+                finalReply = ReplyLanguageGuard.alignReplyWithOrderLanguage(finalReply, orderTitle, orderContent);
+                decision.setReply(finalReply);
             }
             return decision;
         } catch (Exception e) {
