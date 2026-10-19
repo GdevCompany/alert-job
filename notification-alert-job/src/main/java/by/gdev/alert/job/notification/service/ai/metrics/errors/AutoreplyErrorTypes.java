@@ -6,6 +6,8 @@ public final class AutoreplyErrorTypes {
     public static final String TIMEOUT = "TIMEOUT";
     public static final String LOGIN_FAILED = "LOGIN_FAILED";
     public static final String ERROR_OPEN_PAGE = "ERROR_OPEN_PAGE";
+    /** Сеть/прокси: таймаут, tunnel, закрытый браузер, блок IP и т.п. */
+    public static final String PROXY_FAILED = "PROXY_FAILED";
     public static final String EMAIL_INVALID = "EMAIL_INVALID";
     public static final String OTP_NOT_RECEIVED = "OTP_NOT_RECEIVED";
     public static final String TARIFF_LIMIT = "TARIFF_LIMIT";

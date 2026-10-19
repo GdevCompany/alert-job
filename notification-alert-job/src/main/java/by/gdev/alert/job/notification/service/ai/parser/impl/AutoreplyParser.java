@@ -11,6 +11,7 @@ import by.gdev.alert.job.notification.service.ai.parser.debug.ScreenshotService;
 import by.gdev.alert.job.notification.service.ai.proxy.AssignedProxyService;
 import by.gdev.alert.job.notification.service.ai.recovery.AutoreplyFailureAction;
 import by.gdev.alert.job.notification.service.ai.recovery.AutoreplyFailurePolicy;
+import by.gdev.alert.job.notification.service.ai.recovery.AutoreplyProxyFailures;
 import by.gdev.alert.job.notification.service.ai.sessions.AutoreplySessionVerifierFactory;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
@@ -67,9 +68,13 @@ public abstract class AutoreplyParser {
     @Value("${parser.autoreply.post-login.pause-ms:0}")
     protected long postLoginPauseMs;
 
-    /** Сколько попыток логина/автоответа со сменой прокси по политике recovery. */
-    @Value("${parser.autoreply.proxy.switch.max-attempts:3}")
-    private int proxySwitchMaxAttempts;
+    /** Неудач на одном прокси подряд, после чего берём следующий. */
+    @Value("${parser.autoreply.proxy.attempts-per-proxy:3}")
+    private int attemptsPerProxy;
+
+    /** Сколько раз сменить прокси после исчерпания attempts-per-proxy (0 = только закреплённый). */
+    @Value("${parser.autoreply.proxy.max-rotations:2}")
+    private int maxProxyRotations;
 
     protected AssignedProxyService assignedProxyService;
 
@@ -99,11 +104,6 @@ public abstract class AutoreplyParser {
 
     protected AutoreplyParser(AssignedProxyService assignedProxyService) {
         this.assignedProxyService = assignedProxyService;
-    }
-
-    /** Сколько раз открывать браузер заново (смена прокси между попытками). */
-    protected int autoreplyProxySwitchMaxAttempts() {
-        return Math.max(1, proxySwitchMaxAttempts);
     }
 
     /**
@@ -139,12 +139,6 @@ public abstract class AutoreplyParser {
         }
     }
 
-    protected void onAutoreplyAttemptStarted(int attempt) {
-        if (attempt == 1) {
-            PROXY_RETRY_STATE.get().reset();
-        }
-    }
-
     /** Не логиниться в том же браузере (например DDoS — нужен другой прокси). */
     protected boolean skipLoginAfterVerifyFailure(StepResult<Void> verifyResult, AutoreplyMode autoreplyMode) {
         return false;
@@ -152,34 +146,74 @@ public abstract class AutoreplyParser {
 
     public final StepResult<Void> sendAutoreply(DecryptedCredential creds, AiNotificationPayload payload,
                                                 AutoreplyMode autoreplyMode) {
-        // Общий цикл для LOGIN_ONLY (валидация) и FULL_AUTOREPLY (логин при автоответе).
-        int maxAttempts = Math.max(1, autoreplyProxySwitchMaxAttempts());
+        PROXY_RETRY_STATE.get().reset();
+        int perProxyLimit = Math.max(1, attemptsPerProxy);
+        int rotationLimit = Math.max(0, maxProxyRotations);
+        int failuresOnCurrentProxy = 0;
+        int nonProxyRetries = 0;
+        int proxyRotationsDone = 0;
+        int run = 0;
         StepResult<Void> last = null;
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-            onAutoreplyAttemptStarted(attempt);
-            if (attempt > 1 && last != null) {
-                AutoreplyFailureAction action = resolveFailureAction(last);
-                if (action == AutoreplyFailureAction.ROTATE_PROXY) {
-                    prepareNextAutoreplyProxyAttempt(payload, attempt);
-                    log.warn("АВТООТВЕТ: {} -> повтор со сменой прокси, попытка {}/{}, mode={}, action={}, code={}",
-                            getSiteName(), attempt, maxAttempts, autoreplyMode, action, last.getErrorCode());
-                } else {
-                    log.warn("АВТООТВЕТ: {} -> повтор без смены прокси, попытка {}/{}, mode={}, action={}, code={}",
-                            getSiteName(), attempt, maxAttempts, autoreplyMode, action, last.getErrorCode());
-                }
-            }
-            last = runAutoreplyOnce(creds, payload, autoreplyMode);
-            if (!last.failed() || attempt >= maxAttempts) {
+
+        while (true) {
+            run++;
+            last = AutoreplyProxyFailures.tagProxyFailure(runAutoreplyOnce(creds, payload, autoreplyMode));
+            if (!last.failed()) {
                 return last;
             }
+
             AutoreplyFailureAction action = resolveFailureAction(last);
-            log.warn("АВТООТВЕТ: {} -> failure mode={} action={} code={} message={}",
-                    getSiteName(), autoreplyMode, action, last.getErrorCode(), last.getErrorMessage());
+            boolean proxyFailure = AutoreplyProxyFailures.isProxyRelated(last);
+            ProxyCredentials usedProxy = PROXY_RETRY_STATE.get().lastUsed;
+            String proxyLabel = usedProxy != null
+                    ? usedProxy.getHost() + ":" + usedProxy.getPort()
+                    : "нет";
+            log.warn("АВТООТВЕТ: {} -> failure run={} mode={} action={} proxyFailure={} proxy={} code={} message={}",
+                    getSiteName(), run, autoreplyMode, action, proxyFailure, proxyLabel,
+                    last.getErrorCode(), last.getErrorMessage());
             if (action == AutoreplyFailureAction.ABORT) {
                 return last;
             }
+
+            if (!proxyFailure) {
+                nonProxyRetries++;
+                if (nonProxyRetries >= perProxyLimit) {
+                    log.warn("АВТООТВЕТ: {} -> лимит повторов без смены прокси ({}) для не-прокси ошибки, code={}",
+                            getSiteName(), perProxyLimit, last.getErrorCode());
+                    return last;
+                }
+                log.warn("АВТООТВЕТ: {} -> повтор (не прокси) {}/{}, code={}",
+                        getSiteName(), nonProxyRetries, perProxyLimit, last.getErrorCode());
+                continue;
+            }
+
+            failuresOnCurrentProxy++;
+            if (failuresOnCurrentProxy < perProxyLimit) {
+                log.warn("АВТООТВЕТ: {} -> ПРОКСИ: повтор на {} {}/{} (без смены IP), code={}",
+                        getSiteName(), proxyLabel, failuresOnCurrentProxy, perProxyLimit, last.getErrorCode());
+                continue;
+            }
+
+            if (proxyRotationsDone >= rotationLimit) {
+                log.warn("АВТООТВЕТ: {} -> лимит смен прокси ({}) после {} неудач на IP, code={}",
+                        getSiteName(), rotationLimit, perProxyLimit, last.getErrorCode());
+                return last;
+            }
+
+            prepareNextAutoreplyProxyAttempt(payload, proxyRotationsDone + 2);
+            ProxyRetryState state = PROXY_RETRY_STATE.get();
+            if (proxy && state.overrideProxy == null) {
+                log.warn("АВТООТВЕТ: {} -> нет другого прокси после {} неудач на текущем",
+                        getSiteName(), perProxyLimit);
+                return last;
+            }
+
+            failuresOnCurrentProxy = 0;
+            proxyRotationsDone++;
+            log.warn("АВТООТВЕТ: {} -> ПРОКСИ: смена после {} сбоев на {} (ротация {}/{}), code={}",
+                    getSiteName(), perProxyLimit, proxyLabel, proxyRotationsDone, rotationLimit,
+                    last.getErrorCode());
         }
-        return last;
     }
 
     private StepResult<Void> runAutoreplyOnce(DecryptedCredential creds, AiNotificationPayload payload,
@@ -327,7 +361,12 @@ public abstract class AutoreplyParser {
         } catch (Exception e) {
             log.error("Ошибка при отправке автоответа", e);
             byte[] screenshot = page != null ? captureScreenshot(page) : null;
-            return StepResult.fail(StepType.SEND_AUTOREPLY, "Необработанная ошибка: " + e.getMessage(), screenshot);
+            String message = "Необработанная ошибка: " + e.getMessage();
+            String code = AutoreplyProxyFailures.errorCodeForThrowable(e);
+            if (code != null) {
+                return StepResult.fail(StepType.SEND_AUTOREPLY, code, message, screenshot);
+            }
+            return StepResult.fail(StepType.SEND_AUTOREPLY, message, screenshot);
 
         } finally {
             if (captchaService != null) {

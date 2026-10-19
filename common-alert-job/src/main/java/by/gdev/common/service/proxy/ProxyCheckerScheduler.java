@@ -4,6 +4,7 @@ import by.gdev.common.model.proxy.ProxyCredentials;
 import by.gdev.common.model.proxy.ProxyState;
 import by.gdev.common.service.proxy.event.ProxyListUpdatedEvent;
 import by.gdev.common.service.proxy.supplier.ProxySupplier;
+import by.gdev.common.util.DurationFormatter;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -73,7 +74,8 @@ public class ProxyCheckerScheduler {
             log.info("Проверка завершена. Активных: {}", active);
             log.info("Готово. Всего: {}", allProxies.size());
         } else {
-            log.info("Прокси (сводка): рабочих {}/{}, активных {}, всего {}",
+            log.info("Прокси (сводка): за {}, рабочих {}/{}, активных {}, всего {}",
+                    DurationFormatter.formatDuration(summary.elapsedMs()),
                     summary.working(), summary.total(), active, allProxies.size());
         }
     }

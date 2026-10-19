@@ -5,6 +5,7 @@ import by.gdev.common.model.proxy.ProxyCredentials;
 import by.gdev.common.model.proxy.ProxyState;
 import by.gdev.common.service.IpGeoService;
 import by.gdev.common.service.proxy.supplier.ProxySupplier;
+import by.gdev.common.util.DurationFormatter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -29,6 +30,7 @@ public class ProxyCheckerService {
 
     private final ProxySupplier proxySupplier;
     private final IpGeoService ipGeoService;
+    private final ProxyCheckGate proxyCheckGate;
 
     @Value("${proxy.checker.connect-timeout-ms:5000}")
     private int connectTimeoutMs;
@@ -188,7 +190,7 @@ public class ProxyCheckerService {
         lastCheckEndedAtMillis = System.currentTimeMillis();
     }
 
-    public record ProxyCheckSummary(int total, int working, int notWorking) {}
+    public record ProxyCheckSummary(int total, int working, int notWorking, long elapsedMs) {}
 
     /**
      * Проверяет переданный список прокси, обновляя их состояние.
@@ -203,6 +205,16 @@ public class ProxyCheckerService {
      * @param verbose только первый прогон при старте — WARN/DEBUG по каждому прокси; иначе без построчного вывода
      */
     public ProxyCheckSummary checkProxies(List<ProxyCredentials> proxies, boolean countryFilter, boolean verbose) {
+        try {
+            return checkProxiesInternal(proxies, countryFilter, verbose);
+        } finally {
+            if (verbose) {
+                proxyCheckGate.completeInitialCheck();
+            }
+        }
+    }
+
+    private ProxyCheckSummary checkProxiesInternal(List<ProxyCredentials> proxies, boolean countryFilter, boolean verbose) {
         long checkStartedAtMs = System.currentTimeMillis();
         int total = proxies.size();
         int working = 0;
@@ -233,36 +245,12 @@ public class ProxyCheckerService {
                 }
             }
         }
+        long elapsedMs = System.currentTimeMillis() - checkStartedAtMs;
         if (verbose) {
-            long elapsedMs = System.currentTimeMillis() - checkStartedAtMs;
             log.info("Проверка списка прокси завершена за {} (всего {}). Статистика: РАБОЧИЕ = {}, НЕ РАБОЧИЕ = {}",
-                    formatCheckDuration(elapsedMs), total, working, notWorking);
+                    DurationFormatter.formatDuration(elapsedMs), total, working, notWorking);
         }
         markCheckEnded();
-        return new ProxyCheckSummary(total, working, notWorking);
-    }
-
-    private static String formatCheckDuration(long elapsedMs) {
-        if (elapsedMs < 0) {
-            elapsedMs = 0;
-        }
-        long totalSec = elapsedMs / 1000;
-        if (totalSec < 60) {
-            return elapsedMs + " мс";
-        }
-        long min = totalSec / 60;
-        long sec = totalSec % 60;
-        if (min < 60) {
-            return sec > 0 ? min + " мин " + sec + " сек" : min + " мин";
-        }
-        long hours = min / 60;
-        min = min % 60;
-        if (min > 0 && sec > 0) {
-            return hours + " ч " + min + " мин " + sec + " сек";
-        }
-        if (min > 0) {
-            return hours + " ч " + min + " мин";
-        }
-        return hours + " ч " + sec + " сек";
+        return new ProxyCheckSummary(total, working, notWorking, elapsedMs);
     }
 }

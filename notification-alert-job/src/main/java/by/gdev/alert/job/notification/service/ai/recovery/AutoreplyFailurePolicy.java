@@ -7,8 +7,9 @@ import by.gdev.alert.job.notification.service.ai.parser.impl.flru.FlRuPlaywright
 import by.gdev.alert.job.notification.service.ai.parser.youdo.YouDoPlaywrightGuards;
 
 /**
- * Политика recovery по {@code errorCode} / тексту ошибки:
- * {@link AutoreplyFailureAction#ROTATE_PROXY}, {@link AutoreplyFailureAction#RETRY_SAME}, {@link AutoreplyFailureAction#ABORT}.
+ * Политика recovery: {@link AutoreplyFailureAction#ABORT} или {@link AutoreplyFailureAction#RETRY_SAME}.
+ * Смена прокси не здесь — в {@link by.gdev.alert.job.notification.service.ai.parser.impl.AutoreplyParser}
+ * после {@code parser.autoreply.proxy.attempts-per-proxy} неудач на одном IP.
  */
 public final class AutoreplyFailurePolicy {
 
@@ -24,13 +25,15 @@ public final class AutoreplyFailurePolicy {
 
     public static AutoreplyFailureAction resolve(String errorCode, String message) {
         if (message != null && message.contains(FlRuPlaywrightGuards.DDOS_RETRY_FAIL_MARKER)) {
-            return AutoreplyFailureAction.ROTATE_PROXY;
+            return AutoreplyFailureAction.RETRY_SAME;
         }
         if (message != null && message.contains(YouDoPlaywrightGuards.PROXY_BLOCKED_MARKER)) {
             return AutoreplyFailureAction.ROTATE_PROXY;
         }
         if (errorCode == null || errorCode.isBlank()) {
-            return AutoreplyFailureAction.ABORT;
+            return AutoreplyProxyFailures.isProxyRelated(null, message)
+                    ? AutoreplyFailureAction.RETRY_SAME
+                    : AutoreplyFailureAction.ABORT;
         }
 
         try {
@@ -54,7 +57,8 @@ public final class AutoreplyFailurePolicy {
         }
 
         return switch (errorCode) {
-            case AutoreplyErrorTypes.CAPTCHA_FAILED,
+            case AutoreplyErrorTypes.PROXY_FAILED,
+                 AutoreplyErrorTypes.CAPTCHA_FAILED,
                  AutoreplyErrorTypes.TIMEOUT,
                  AutoreplyErrorTypes.ERROR_OPEN_PAGE,
                  "YOUDO_EMAIL_SUBMIT_STUCK",
@@ -70,7 +74,7 @@ public final class AutoreplyFailurePolicy {
                  AutoreplyErrorTypes.ORDER_EXECUTOR_SELECTED,
                  AutoreplyErrorTypes.SITE_MAINTENANCE,
                  AutoreplyErrorTypes.EMAIL_CODE_LOGIN_ENABLED -> AutoreplyFailureAction.ABORT;
-            default -> AutoreplyFailureAction.ABORT;
+            default -> AutoreplyFailureAction.RETRY_SAME;
         };
     }
 }
