@@ -120,7 +120,7 @@ public class ProxySupplier {
 
     // Получение всего списка
     public synchronized List<ProxyCredentials> getProxies() {
-        return proxies;
+        return new ArrayList<>(proxies);
     }
 
     /**
@@ -181,7 +181,4 @@ public class ProxySupplier {
         index++;
         return pc;
     }
-
-    // ---- Логирование diff (оставлено без изменений) ----
-    public void logProxyDiff(List<ProxyCredentials> oldList, List<ProxyCredentials> newList) { /* ... */ }
 }

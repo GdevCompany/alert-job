@@ -17,6 +17,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 
@@ -215,8 +216,9 @@ public class ProxyCheckerService {
     }
 
     private ProxyCheckSummary checkProxiesInternal(List<ProxyCredentials> proxies, boolean countryFilter, boolean verbose) {
+        List<ProxyCredentials> toCheck = new ArrayList<>(proxies);
         long checkStartedAtMs = System.currentTimeMillis();
-        int total = proxies.size();
+        int total = toCheck.size();
         int working = 0;
         int notWorking = 0;
         int processed = 0;
@@ -231,7 +233,7 @@ public class ProxyCheckerService {
                     total, tunnelCheckEnabled, tunnelHost, tunnelPort);
         }
 
-        for (ProxyCredentials proxy : proxies) {
+        for (ProxyCredentials proxy : toCheck) {
             checkAndUpdateProxy(proxy, countryFilter, verbose);
             switch (proxy.getState()) {
                 case ACTIVE, WARMING_UP -> working++;
