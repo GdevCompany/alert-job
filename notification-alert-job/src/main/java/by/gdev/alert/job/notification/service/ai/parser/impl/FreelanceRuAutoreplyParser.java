@@ -21,6 +21,19 @@ import org.springframework.stereotype.Component;
 @Component
 public class FreelanceRuAutoreplyParser extends AutoreplyParser implements AutoreplyPlaywrightParser {
 
+    private static final String EXECUTOR_SELECTED_STATUS_TITLE = "Исполнитель выбран";
+
+    /** Плашка {@code div.status-card} с заголовком «Исполнитель выбран» — отклик недоступен. */
+    private static final String[] EXECUTOR_SELECTED_STATUS_SELECTORS = {
+            "div.status-card:has(div.status-card__title:text-is('" + EXECUTOR_SELECTED_STATUS_TITLE + "'))",
+            "div.status-card .status-card__title:text-is('" + EXECUTOR_SELECTED_STATUS_TITLE + "')",
+            "div.status-card__title:has-text('" + EXECUTOR_SELECTED_STATUS_TITLE + "')"
+    };
+
+    private static final String EXECUTOR_SELECTED_USER_MESSAGE =
+            "На freelance.ru по этому заказу уже выбран исполнитель — новые отклики не принимаются. "
+                    + "Автоответ не отправлен.";
+
     @Value("${parser.autoreply.headless.freelance.ru:true}")
     private void setHeadless(boolean headless) {
         this.headless = headless;
@@ -172,17 +185,30 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
             return StepResult.fail(StepType.SEND_AUTOREPLY, "Не удалось открыть заказ: " + e.getMessage(), captureScreenshot(page));
         }
 
+        StepResult<Void> executorSelected = failIfExecutorAlreadySelected(page, login);
+        if (executorSelected != null) {
+            return executorSelected;
+        }
+
         // Новая вёрстка: карточка #rootReplyCard с textarea#rootReplyText и кнопкой #rootCreateReply.
         // Старая: модалка после клика по «Откликнуться» и скрытый шаблон #replyText.
         String replySelector = "textarea#rootReplyText";
         String sendSelector = "button#rootCreateReply";
 
         if (!waitForVisibleOrFail(page, replySelector, "Поле ответа (rootReplyText)")) {
+            executorSelected = failIfExecutorAlreadySelected(page, login);
+            if (executorSelected != null) {
+                return executorSelected;
+            }
             log.info("АВТООТВЕТ: {} -> форма root не найдена, пробуем старый сценарий с модалкой, пользователь: {}",
                     getSiteName(), login);
             if (!clickOrFail(page,
                     "#rootCreateReply, button.btn.btn--success.btn--lg:has-text('Откликнуться')",
                     "Кнопка 'Откликнуться'")) {
+                executorSelected = failIfExecutorAlreadySelected(page, login);
+                if (executorSelected != null) {
+                    return executorSelected;
+                }
                 report(Level.WARN, log,
                         "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНА КНОПКА 'Откликнуться', пользователь: " + login,
                         AutoreplyErrorTypes.BUTTON_NOT_FOUND);
@@ -191,6 +217,10 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
             replySelector = "textarea#replyText[name='TaskReply[text]']";
             sendSelector = "button#createReply.btn.btn--success.btn--sm";
             if (!waitForVisibleOrFail(page, replySelector, "Поле ответа (replyText)")) {
+                executorSelected = failIfExecutorAlreadySelected(page, login);
+                if (executorSelected != null) {
+                    return executorSelected;
+                }
                 report(Level.WARN, log,
                         "АВТООТВЕТ: " + getSiteName() + " -> НЕ НАЙДЕНО ВИДИМОЕ ПОЛЕ ОТВЕТА, пользователь: " + login,
                         AutoreplyErrorTypes.FIELD_NOT_FOUND);
@@ -262,6 +292,43 @@ public class FreelanceRuAutoreplyParser extends AutoreplyParser implements Autor
         page.waitForTimeout(2000);
         log.info("АВТООТВЕТ: {} -> ОТКЛИК УСПЕШНО ЗАВЕРШЁН, пользователь: {}", getSiteName(), login);
         return StepResult.ok(StepType.SEND_AUTOREPLY, null);
+    }
+
+    private StepResult<Void> failIfExecutorAlreadySelected(Page page, String login) {
+        if (!isExecutorSelectedStatusCardVisible(page)) {
+            return null;
+        }
+        log.warn("АВТООТВЕТ: {} -> исполнитель уже выбран (status-card), url={}, пользователь: {}",
+                getSiteName(), page.url(), login);
+        report(Level.WARN, log,
+                "АВТООТВЕТ: " + getSiteName() + " -> ИСПОЛНИТЕЛЬ УЖЕ ВЫБРАН, пользователь: " + login,
+                AutoreplyErrorTypes.ORDER_EXECUTOR_SELECTED);
+        return StepResult.fail(StepType.SEND_AUTOREPLY, AutoreplyErrorTypes.ORDER_EXECUTOR_SELECTED,
+                EXECUTOR_SELECTED_USER_MESSAGE, captureScreenshot(page));
+    }
+
+    private boolean isExecutorSelectedStatusCardVisible(Page page) {
+        if (page == null) {
+            return false;
+        }
+        try {
+            for (String selector : EXECUTOR_SELECTED_STATUS_SELECTORS) {
+                Locator card = page.locator(selector).first();
+                if (card.count() > 0 && card.isVisible()) {
+                    return true;
+                }
+            }
+            Locator title = page.locator("div.status-card__title")
+                    .filter(new Locator.FilterOptions().setHasText(EXECUTOR_SELECTED_STATUS_TITLE))
+                    .first();
+            if (title.count() > 0 && title.isVisible()) {
+                Locator parent = title.locator("xpath=ancestor::div[contains(@class,'status-card')][1]");
+                return parent.count() > 0 && parent.first().isVisible();
+            }
+        } catch (Exception e) {
+            log.debug("АВТООТВЕТ: {} -> проверка status-card: {}", getSiteName(), e.getMessage());
+        }
+        return false;
     }
 
     private void dismissCookieBannerIfPresent(Page page) {

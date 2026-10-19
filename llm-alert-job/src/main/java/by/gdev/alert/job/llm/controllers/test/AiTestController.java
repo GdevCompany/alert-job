@@ -82,7 +82,8 @@ public class AiTestController {
                     testOrder,
                     request.getTemplateId(),
                     request.getPromptId(),
-                    uuid
+                    uuid,
+                    null
             );
 
             TestAutoreplyResponse response = TestAutoreplyResponse.builder()

@@ -173,26 +173,26 @@ export const BindingUpdateRequestNotificationTypeEnum = {
 
 export type BindingUpdateRequestNotificationTypeEnum = typeof BindingUpdateRequestNotificationTypeEnum[keyof typeof BindingUpdateRequestNotificationTypeEnum];
 
+export interface CredentialValidationJobResponse {
+    'jobId'?: string;
+    'status'?: CredentialValidationJobResponseStatusEnum;
+    'result'?: CredentialValidationResult;
+}
+
+export const CredentialValidationJobResponseStatusEnum = {
+    Pending: 'PENDING',
+    Completed: 'COMPLETED',
+    Failed: 'FAILED',
+} as const;
+
+export type CredentialValidationJobResponseStatusEnum = typeof CredentialValidationJobResponseStatusEnum[keyof typeof CredentialValidationJobResponseStatusEnum];
+
 export interface CredentialValidationResult {
     'success'?: boolean;
     'errorMessage'?: string;
     'errorCode'?: string;
     'recommendedAction'?: string;
 }
-
-export interface CredentialValidationJobResponse {
-    'jobId'?: string;
-    'status'?: CredentialValidationJobStatusEnum;
-    'result'?: CredentialValidationResult;
-}
-
-export const CredentialValidationJobStatusEnum = {
-    Pending: 'PENDING',
-    Completed: 'COMPLETED',
-    Failed: 'FAILED',
-} as const;
-
-export type CredentialValidationJobStatusEnum = typeof CredentialValidationJobStatusEnum[keyof typeof CredentialValidationJobStatusEnum];
 export interface DailySubscriptionStat {
     'id'?: number;
     'statDate'?: string;
@@ -1419,6 +1419,40 @@ export const UserCredentialsApiAxiosParamCreator = function (configuration?: Con
             };
         },
         /**
+         * Пока status=PENDING, проверка на бирже ещё идёт в notification.
+         * @summary Статус задачи проверки учётных данных
+         * @param {string} jobId 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        getCredentialValidationJob: async (jobId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'jobId' is not null or undefined
+            assertParamExists('getCredentialValidationJob', 'jobId', jobId)
+            const localVarPath = `/api/credentials/validate/jobs/{jobId}`
+                .replace('{jobId}', encodeURIComponent(String(jobId)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            localVarHeaderParameter['Accept'] = '*/*';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
          * Возвращает логин и зашифрованный пароль для указанного ID учётной записи.
          * @summary Получить зашифрованные учётные данные по ID
          * @param {number} credentialId 
@@ -1456,22 +1490,25 @@ export const UserCredentialsApiAxiosParamCreator = function (configuration?: Con
             };
         },
         /**
-         * 
+         * Вместо долгого синхронного ответа — 202 и jobId. Итог: GET /validate/jobs/{jobId}. GET оставлен для совместимости со старым фронтом.
+         * @summary Запустить проверку учётных данных (асинхронно)
          * @param {number} credentialId 
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
         startCredentialValidation: async (credentialId: number, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'credentialId' is not null or undefined
             assertParamExists('startCredentialValidation', 'credentialId', credentialId)
             const localVarPath = `/api/credentials/validate/{credentialId}`
                 .replace('{credentialId}', encodeURIComponent(String(credentialId)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
             let baseOptions;
             if (configuration) {
                 baseOptions = configuration.baseOptions;
             }
 
-            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
             const localVarHeaderParameter = {} as any;
             const localVarQueryParameter = {} as any;
 
@@ -1486,17 +1523,26 @@ export const UserCredentialsApiAxiosParamCreator = function (configuration?: Con
                 options: localVarRequestOptions,
             };
         },
-        getCredentialValidationJob: async (jobId: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
-            assertParamExists('getCredentialValidationJob', 'jobId', jobId)
-            const localVarPath = `/api/credentials/validate/jobs/{jobId}`
-                .replace('{jobId}', encodeURIComponent(String(jobId)));
+        /**
+         * Вместо долгого синхронного ответа — 202 и jobId. Итог: GET /validate/jobs/{jobId}. GET оставлен для совместимости со старым фронтом.
+         * @summary Запустить проверку учётных данных (асинхронно)
+         * @param {number} credentialId 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        startCredentialValidation1: async (credentialId: number, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'credentialId' is not null or undefined
+            assertParamExists('startCredentialValidation1', 'credentialId', credentialId)
+            const localVarPath = `/api/credentials/validate/{credentialId}`
+                .replace('{credentialId}', encodeURIComponent(String(credentialId)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
             let baseOptions;
             if (configuration) {
                 baseOptions = configuration.baseOptions;
             }
 
-            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarRequestOptions = { method: 'POST', ...baseOptions, ...options};
             const localVarHeaderParameter = {} as any;
             const localVarQueryParameter = {} as any;
 
@@ -1559,6 +1605,19 @@ export const UserCredentialsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
+         * Пока status=PENDING, проверка на бирже ещё идёт в notification.
+         * @summary Статус задачи проверки учётных данных
+         * @param {string} jobId 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async getCredentialValidationJob(jobId: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<CredentialValidationJobResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.getCredentialValidationJob(jobId, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['UserCredentialsApi.getCredentialValidationJob']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
          * Возвращает логин и зашифрованный пароль для указанного ID учётной записи.
          * @summary Получить зашифрованные учётные данные по ID
          * @param {number} credentialId 
@@ -1572,7 +1631,8 @@ export const UserCredentialsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * 
+         * Вместо долгого синхронного ответа — 202 и jobId. Итог: GET /validate/jobs/{jobId}. GET оставлен для совместимости со старым фронтом.
+         * @summary Запустить проверку учётных данных (асинхронно)
          * @param {number} credentialId 
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
@@ -1583,10 +1643,17 @@ export const UserCredentialsApiFp = function(configuration?: Configuration) {
             const localVarOperationServerBasePath = operationServerMap['UserCredentialsApi.startCredentialValidation']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
-        async getCredentialValidationJob(jobId: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<CredentialValidationJobResponse>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.getCredentialValidationJob(jobId, options);
+        /**
+         * Вместо долгого синхронного ответа — 202 и jobId. Итог: GET /validate/jobs/{jobId}. GET оставлен для совместимости со старым фронтом.
+         * @summary Запустить проверку учётных данных (асинхронно)
+         * @param {number} credentialId 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async startCredentialValidation1(credentialId: number, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<CredentialValidationJobResponse>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.startCredentialValidation1(credentialId, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
-            const localVarOperationServerBasePath = operationServerMap['UserCredentialsApi.getCredentialValidationJob']?.[localVarOperationServerIndex]?.url;
+            const localVarOperationServerBasePath = operationServerMap['UserCredentialsApi.startCredentialValidation1']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
     }
@@ -1628,6 +1695,16 @@ export const UserCredentialsApiFactory = function (configuration?: Configuration
             return localVarFp.getAllUserCredentials(options).then((request) => request(axios, basePath));
         },
         /**
+         * Пока status=PENDING, проверка на бирже ещё идёт в notification.
+         * @summary Статус задачи проверки учётных данных
+         * @param {string} jobId 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        getCredentialValidationJob(jobId: string, options?: RawAxiosRequestConfig): AxiosPromise<CredentialValidationJobResponse> {
+            return localVarFp.getCredentialValidationJob(jobId, options).then((request) => request(axios, basePath));
+        },
+        /**
          * Возвращает логин и зашифрованный пароль для указанного ID учётной записи.
          * @summary Получить зашифрованные учётные данные по ID
          * @param {number} credentialId 
@@ -1638,7 +1715,8 @@ export const UserCredentialsApiFactory = function (configuration?: Configuration
             return localVarFp.getEncryptedById(credentialId, options).then((request) => request(axios, basePath));
         },
         /**
-         * 
+         * Вместо долгого синхронного ответа — 202 и jobId. Итог: GET /validate/jobs/{jobId}. GET оставлен для совместимости со старым фронтом.
+         * @summary Запустить проверку учётных данных (асинхронно)
          * @param {number} credentialId 
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
@@ -1646,8 +1724,15 @@ export const UserCredentialsApiFactory = function (configuration?: Configuration
         startCredentialValidation(credentialId: number, options?: RawAxiosRequestConfig): AxiosPromise<CredentialValidationJobResponse> {
             return localVarFp.startCredentialValidation(credentialId, options).then((request) => request(axios, basePath));
         },
-        getCredentialValidationJob(jobId: string, options?: RawAxiosRequestConfig): AxiosPromise<CredentialValidationJobResponse> {
-            return localVarFp.getCredentialValidationJob(jobId, options).then((request) => request(axios, basePath));
+        /**
+         * Вместо долгого синхронного ответа — 202 и jobId. Итог: GET /validate/jobs/{jobId}. GET оставлен для совместимости со старым фронтом.
+         * @summary Запустить проверку учётных данных (асинхронно)
+         * @param {number} credentialId 
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        startCredentialValidation1(credentialId: number, options?: RawAxiosRequestConfig): AxiosPromise<CredentialValidationJobResponse> {
+            return localVarFp.startCredentialValidation1(credentialId, options).then((request) => request(axios, basePath));
         },
     };
 };
@@ -1689,6 +1774,17 @@ export class UserCredentialsApi extends BaseAPI {
     }
 
     /**
+     * Пока status=PENDING, проверка на бирже ещё идёт в notification.
+     * @summary Статус задачи проверки учётных данных
+     * @param {string} jobId 
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public getCredentialValidationJob(jobId: string, options?: RawAxiosRequestConfig) {
+        return UserCredentialsApiFp(this.configuration).getCredentialValidationJob(jobId, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
      * Возвращает логин и зашифрованный пароль для указанного ID учётной записи.
      * @summary Получить зашифрованные учётные данные по ID
      * @param {number} credentialId 
@@ -1700,7 +1796,8 @@ export class UserCredentialsApi extends BaseAPI {
     }
 
     /**
-     * 
+     * Вместо долгого синхронного ответа — 202 и jobId. Итог: GET /validate/jobs/{jobId}. GET оставлен для совместимости со старым фронтом.
+     * @summary Запустить проверку учётных данных (асинхронно)
      * @param {number} credentialId 
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
@@ -1709,8 +1806,15 @@ export class UserCredentialsApi extends BaseAPI {
         return UserCredentialsApiFp(this.configuration).startCredentialValidation(credentialId, options).then((request) => request(this.axios, this.basePath));
     }
 
-    public getCredentialValidationJob(jobId: string, options?: RawAxiosRequestConfig) {
-        return UserCredentialsApiFp(this.configuration).getCredentialValidationJob(jobId, options).then((request) => request(this.axios, this.basePath));
+    /**
+     * Вместо долгого синхронного ответа — 202 и jobId. Итог: GET /validate/jobs/{jobId}. GET оставлен для совместимости со старым фронтом.
+     * @summary Запустить проверку учётных данных (асинхронно)
+     * @param {number} credentialId 
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public startCredentialValidation1(credentialId: number, options?: RawAxiosRequestConfig) {
+        return UserCredentialsApiFp(this.configuration).startCredentialValidation1(credentialId, options).then((request) => request(this.axios, this.basePath));
     }
 }
 
