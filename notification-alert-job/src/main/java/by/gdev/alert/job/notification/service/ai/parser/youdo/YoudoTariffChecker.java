@@ -1,4 +1,4 @@
-package by.gdev.alert.job.notification.service.ai.parser;
+package by.gdev.alert.job.notification.service.ai.parser.youdo;
 
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;

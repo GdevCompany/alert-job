@@ -24,14 +24,11 @@ import java.util.regex.Pattern;
 
 /**
  * HTTP-клиент 2Captcha API v2:
- * Yandex SmartCaptcha (token), PazlCaptchaTask (kaleidoscope clicks), hCaptcha.
+ * Yandex SmartCaptcha (token, proxyless), AudioTask, опционально PazlCaptchaTask, hCaptcha.
  */
 @Component
 @Slf4j
 public class TwoCaptchaClient {
-
-    private static final String CREATE_TASK_URL = "https://api.2captcha.com/createTask";
-    private static final String GET_RESULT_URL = "https://api.2captcha.com/getTaskResult";
 
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -42,6 +39,13 @@ public class TwoCaptchaClient {
     @Value("${captcha.two-captcha.api-key:}")
     private String apiKey;
 
+    /**
+     * API v2: по умолчанию {@code https://api.2captcha.com}.
+     * ruCaptcha — тот же протокол, другой хост: {@code captcha.two-captcha.api-base-url=https://api.rucaptcha.com}.
+     */
+    @Value("${captcha.two-captcha.api-base-url:https://api.2captcha.com}")
+    private String apiBaseUrl;
+
     @Value("${captcha.two-captcha.poll-interval-ms:3000}")
     private long pollIntervalMs;
 
@@ -51,6 +55,17 @@ public class TwoCaptchaClient {
     /** Сколько раз создавать новую задачу при timeout/processing (только hCaptcha / Yandex). */
     @Value("${captcha.two-captcha.task-max-attempts:2}")
     private int taskMaxAttempts;
+
+    /** reportIncorrect / reportCorrect (возврат средств у 2Captcha). */
+    @Value("${captcha.two-captcha.reports.enabled:true}")
+    private boolean reportsEnabled;
+
+    /**
+     * Передавать в 2Captcha тот же HTTP-прокси, что у Playwright ({@code YandexSmartCaptchaTask}),
+     * чтобы IP решения совпадал с сессией браузера (важно для YouDo).
+     */
+    @Value("${captcha.yandex.two-captcha-use-browser-proxy:true}")
+    private boolean yandexUseBrowserProxy;
 
     @PostConstruct
     void logConfiguration() {
@@ -63,7 +78,8 @@ public class TwoCaptchaClient {
             log.warn("2Captcha: включено, но captcha.two-captcha.api-key / TWO_CAPTCHA_API_KEY пустой");
             return;
         }
-        log.info("2Captcha: включено, clientKey={}", maskClientKey(key));
+        log.info("2Captcha: включено, провайдер={}, apiBase={}, clientKey={}",
+                CaptchaVendorLog.providerLabel(normalizedApiBase()), normalizedApiBase(), maskClientKey(key));
         if (apiKey != null && !apiKey.equals(key)) {
             log.warn("2Captcha: в api-key были пробелы по краям — в запросах используется trim()");
         }
@@ -76,6 +92,22 @@ public class TwoCaptchaClient {
 
     private String effectiveApiKey() {
         return apiKey == null ? "" : apiKey.trim();
+    }
+
+    private String normalizedApiBase() {
+        if (apiBaseUrl == null || apiBaseUrl.isBlank()) {
+            return "https://api.2captcha.com";
+        }
+        String base = apiBaseUrl.trim();
+        while (base.endsWith("/")) {
+            base = base.substring(0, base.length() - 1);
+        }
+        return base;
+    }
+
+    private String apiUrl(String path) {
+        String p = path.startsWith("/") ? path : "/" + path;
+        return normalizedApiBase() + p;
     }
 
     private static String maskClientKey(String key) {
@@ -92,13 +124,22 @@ public class TwoCaptchaClient {
      * @return токен smart-captcha или empty при ошибке / отключённом сервисе
      */
     public Optional<String> solveYandexSmartCaptcha(String pageUrl, String siteKey, String userAgent, String cookies) {
+        if (!isConfigured()) {
+            log.warn("2Captcha: запрос пропущен — enabled={}, clientKey={}",
+                    enabled, maskClientKey(effectiveApiKey()));
+            return Optional.empty();
+        }
+        if (siteKey == null || siteKey.isBlank()) {
+            log.warn("2Captcha: sitekey не найден для {}", pageUrl);
+            return Optional.empty();
+        }
         return solveYandexSmartCaptcha(pageUrl, siteKey, userAgent, cookies, null);
     }
 
     /**
      * Решает Yandex SmartCaptcha через 2Captcha.
-     * Если передан {@code proxy} — {@code YandexSmartCaptchaTask} (тот же IP, что у браузера).
-     * Иначе — {@code YandexSmartCaptchaTaskProxyless}.
+     * При {@code captcha.yandex.two-captcha-use-browser-proxy=true} и непустом {@code proxy}
+     * создаётся {@code YandexSmartCaptchaTask} с тем же HTTP-прокси, что у браузера.
      */
     public Optional<String> solveYandexSmartCaptcha(String pageUrl, String siteKey, String userAgent, String cookies,
                                                     ProxyCredentials proxy) {
@@ -111,23 +152,41 @@ public class TwoCaptchaClient {
             log.warn("2Captcha: sitekey не найден для {}", pageUrl);
             return Optional.empty();
         }
-
-        String kind = proxy != null
-                ? "Yandex SmartCaptcha (proxy " + proxy.getHost() + ":" + proxy.getPort() + ")"
+        ProxyCredentials effectiveProxy = resolveYandexProxy(proxy);
+        String kind = effectiveProxy != null
+                ? "Yandex SmartCaptcha (browser proxy)"
                 : "Yandex SmartCaptcha (proxyless)";
+        if (effectiveProxy != null) {
+            log.info("2Captcha: Yandex SmartCaptcha через прокси браузера {}:{} (type=YandexSmartCaptchaTask)",
+                    effectiveProxy.getHost(), effectiveProxy.getPort());
+        }
         return solveWithRetries(pageUrl, kind, () -> {
-            long taskId = createYandexTask(pageUrl, siteKey, userAgent, cookies, proxy);
+            long taskId = createYandexTask(pageUrl, siteKey, userAgent, cookies, effectiveProxy);
             return pollTaskResult(taskId, kind);
         });
+    }
+
+    private ProxyCredentials resolveYandexProxy(ProxyCredentials proxy) {
+        if (!yandexUseBrowserProxy || proxy == null) {
+            return null;
+        }
+        if (proxy.getHost() == null || proxy.getHost().isBlank() || proxy.getPort() <= 0) {
+            return null;
+        }
+        return proxy;
     }
 
     /**
      * Решение PazlCaptcha: либо число кликов ({@code "8"}), либо точка на отправленном PNG
      * ({@code coordinates:x=189,y=63}). Ширина/letterbox учитываются в CaptchaService при маппинге на bbox.
      */
-    public record PazlSolution(Integer clicks, Integer imageX, Integer imageY, int imageWidth) {
+    public record PazlSolution(Integer clicks, Integer imageX, Integer imageY, int imageWidth, long twoCaptchaTaskId) {
         public PazlSolution(Integer clicks, Integer imageX, int imageWidth) {
-            this(clicks, imageX, null, imageWidth);
+            this(clicks, imageX, null, imageWidth, 0L);
+        }
+
+        public PazlSolution(Integer clicks, Integer imageX, Integer imageY, int imageWidth) {
+            this(clicks, imageX, imageY, imageWidth, 0L);
         }
 
         public boolean hasImageX() {
@@ -137,23 +196,45 @@ public class TwoCaptchaClient {
         public boolean hasClicks() {
             return clicks != null && clicks >= 0;
         }
+
+        public boolean hasTaskId() {
+            return twoCaptchaTaskId > 0;
+        }
+    }
+
+    /** Результат одной серии запросов PazlCaptchaTask к 2Captcha. */
+    public record PazlCaptchaInvokeResult(Optional<PazlSolution> solution, boolean audioFallback) {
+
+        public static PazlCaptchaInvokeResult solved(PazlSolution s) {
+            return new PazlCaptchaInvokeResult(Optional.of(s), false);
+        }
+
+        public static PazlCaptchaInvokeResult forAudioFallback() {
+            return new PazlCaptchaInvokeResult(Optional.empty(), true);
+        }
+
+        public static PazlCaptchaInvokeResult notSolved() {
+            return new PazlCaptchaInvokeResult(Optional.empty(), false);
+        }
     }
 
     /**
      * Калейдоскоп (слайдер-пазл). По доке 2Captcha solution = число кликов по стрелке ({@code "8"}).
      * Воркеры иногда отдают {@code coordinates:…} (клики по картинке) — это не ответ Pazl, такие
      * решения отбрасываем и создаём новую задачу.
+     * <p>
+     * При первом {@code solution=0} сразу {@link PazlCaptchaInvokeResult#forAudioFallback()} — без повторных Pazl.
      */
-    public Optional<PazlSolution> solvePazlCaptcha(String imageBase64, String taskJson,
-                                                   int sliderMax, int imageWidth) {
+    public PazlCaptchaInvokeResult solvePazlCaptcha(String imageBase64, String taskJson,
+                                                    int sliderMax, int imageWidth) {
         if (!isConfigured()) {
             log.warn("2Captcha: PazlCaptcha пропущен — enabled={}, clientKey={}",
                     enabled, maskClientKey(effectiveApiKey()));
-            return Optional.empty();
+            return PazlCaptchaInvokeResult.notSolved();
         }
         if (imageBase64 == null || imageBase64.isBlank() || taskJson == null || taskJson.isBlank()) {
             log.warn("2Captcha: PazlCaptcha — пустые image/task");
-            return Optional.empty();
+            return PazlCaptchaInvokeResult.notSolved();
         }
         String image = stripDataUrlPrefix(imageBase64);
         int max = sliderMax > 0 ? Math.min(sliderMax, 64) : 28;
@@ -176,19 +257,34 @@ public class TwoCaptchaClient {
                 log.info("2Captcha: PazlCaptcha raw solution={} imageW={}", rawSol, imgW);
                 Optional<PazlSolution> sol = parsePazlSolution(rawSol, max, imgW);
                 if (sol.isEmpty()) {
-                    log.warn("2Captcha: PazlCaptcha — не разобрали solution (см. raw выше)");
+                    log.warn("2Captcha: PazlCaptcha — не разобрали solution (см. raw выше), reportIncorrect");
+                    reportIncorrect(taskId);
                     continue;
                 }
                 PazlSolution s = sol.get();
-                if (s.hasClicks()) {
+                if (s.hasClicks() && s.clicks() != null && s.clicks() > 0) {
+                    PazlSolution withId = new PazlSolution(s.clicks(), s.imageX(), s.imageY(), s.imageWidth(), taskId);
                     log.info("2Captcha: PazlCaptcha → clicks={} sliderMax={} (taskId={})",
-                            s.clicks(), max, taskId);
-                    return sol;
+                            withId.clicks(), max, taskId);
+                    CaptchaVendorLog.applyVendorAnswer(normalizedApiBase(), "PazlCaptchaTask", taskId,
+                            "кликов по стрелке слайдера: " + withId.clicks(),
+                            "Playwright YandexKaleidoscopeSolver.applySliderClicks");
+                    return PazlCaptchaInvokeResult.solved(withId);
+                }
+                if (s.hasClicks() && s.clicks() != null && s.clicks() == 0) {
+                    log.warn("2Captcha: PazlCaptcha → solution=0 — reportIncorrect и переход на audio, taskId={}",
+                            taskId);
+                    CaptchaVendorLog.vendorResponse(normalizedApiBase(), "PazlCaptchaTask", taskId, rawSol,
+                            "НЕТ (solution=0)", "YandexSmartCaptchaAudioSolver (AudioTask в сессии браузера)");
+                    reportIncorrect(taskId);
+                    return PazlCaptchaInvokeResult.forAudioFallback();
                 }
                 // coordinates — воркер решил как click-captcha, для слайдера бесполезно
-                log.warn("2Captcha: PazlCaptcha → coordinates вместо кликов (x={} y={}) — отбрасываем, новая задача",
+                log.warn("2Captcha: PazlCaptcha → coordinates вместо кликов (x={} y={}) — reportIncorrect",
                         s.imageX(), s.imageY());
-                reportIncorrectQuiet(taskId);
+                CaptchaVendorLog.vendorResponse(normalizedApiBase(), "PazlCaptchaTask", taskId, rawSol,
+                        CaptchaVendorLog.interpretPazlRaw(rawSol), "никто — reportIncorrect + новая задача");
+                reportIncorrect(taskId);
             } catch (Exception e) {
                 lastError = e;
                 log.warn("2Captcha: PazlCaptcha — попытка {}/{} ошибка: {}", attempt, attempts, e.getMessage());
@@ -198,14 +294,14 @@ public class TwoCaptchaClient {
             log.error("2Captcha: не удалось решить PazlCaptcha", lastError);
         }
         log.warn("2Captcha: PazlCaptcha — за {} попыток не получили число кликов", attempts);
-        return Optional.empty();
+        return PazlCaptchaInvokeResult.notSolved();
     }
 
-    public Optional<PazlSolution> solvePazlCaptcha(String imageBase64, String taskJson, int sliderMax) {
+    public PazlCaptchaInvokeResult solvePazlCaptcha(String imageBase64, String taskJson, int sliderMax) {
         return solvePazlCaptcha(imageBase64, taskJson, sliderMax, 0);
     }
 
-    public Optional<PazlSolution> solvePazlCaptcha(String imageBase64, String taskJson) {
+    public PazlCaptchaInvokeResult solvePazlCaptcha(String imageBase64, String taskJson) {
         return solvePazlCaptcha(imageBase64, taskJson, 28, 0);
     }
 
@@ -382,9 +478,20 @@ public class TwoCaptchaClient {
 
     public record AudioResult(String text, long taskId) {}
 
-    /** Публичный reportIncorrect (неверное ASR / не цифры). */
+    /** Публичный reportIncorrect (неверный solution / не прошло на сайте). */
     public void reportIncorrect(long taskId) {
+        if (!reportsEnabled || taskId <= 0) {
+            return;
+        }
         reportIncorrectQuiet(taskId);
+    }
+
+    /** reportCorrect — если solution реально помог на сайте (возврат не нужен, обучение воркеров). */
+    public void reportCorrect(long taskId) {
+        if (!reportsEnabled || taskId <= 0) {
+            return;
+        }
+        reportCorrectQuiet(taskId);
     }
 
     private long createAudioTask(String audioBase64, String lang) throws Exception {
@@ -400,9 +507,9 @@ public class TwoCaptchaClient {
         body.put("task", task);
 
         log.info("2Captcha: createTask AudioTask → {} clientKey={} audioB64Len={} lang={}",
-                CREATE_TASK_URL, maskClientKey(clientKey), audioBase64.length(), lang);
+                apiUrl("/createTask"), maskClientKey(clientKey), audioBase64.length(), lang);
 
-        JsonNode response = postJson(CREATE_TASK_URL, body);
+        JsonNode response = postCaptchaJson("/createTask", body, "createTask", "AudioTask", 0, true, true);
         int errorId = response.path("errorId").asInt(-1);
         if (errorId != 0) {
             throw new IllegalStateException("createTask AudioTask errorId=" + errorId
@@ -414,6 +521,8 @@ public class TwoCaptchaClient {
             throw new IllegalStateException("createTask AudioTask: пустой taskId");
         }
         log.info("2Captcha: задача AudioTask создана, taskId={}", taskId);
+        CaptchaVendorLog.vendorRequest(normalizedApiBase(), "createTask", "AudioTask", taskId,
+                "mp3 base64 → ожидаем solution.text");
         return taskId;
     }
 
@@ -451,16 +560,14 @@ public class TwoCaptchaClient {
     private long createYandexTask(String pageUrl, String siteKey, String userAgent, String cookies,
                                   ProxyCredentials proxy) throws Exception {
         Map<String, Object> task = new LinkedHashMap<>();
-        if (proxy != null && proxy.getHost() != null && !proxy.getHost().isBlank()) {
+        if (proxy != null && proxy.getHost() != null && !proxy.getHost().isBlank() && proxy.getPort() > 0) {
             task.put("type", "YandexSmartCaptchaTask");
             task.put("proxyType", "http");
             task.put("proxyAddress", proxy.getHost());
             task.put("proxyPort", proxy.getPort());
             if (proxy.getUsername() != null && !proxy.getUsername().isBlank()) {
                 task.put("proxyLogin", proxy.getUsername());
-            }
-            if (proxy.getPassword() != null && !proxy.getPassword().isBlank()) {
-                task.put("proxyPassword", proxy.getPassword());
+                task.put("proxyPassword", proxy.getPassword() != null ? proxy.getPassword() : "");
             }
         } else {
             task.put("type", "YandexSmartCaptchaTaskProxyless");
@@ -480,10 +587,11 @@ public class TwoCaptchaClient {
         body.put("task", task);
 
         log.info("2Captcha: createTask → {} type={} clientKey={}",
-                CREATE_TASK_URL, task.get("type"), maskClientKey(clientKey));
+                apiUrl("/createTask"), task.get("type"), maskClientKey(clientKey));
         log.debug("2Captcha: createTask clientKey (полностью)={}", clientKey);
 
-        JsonNode response = postJson(CREATE_TASK_URL, body);
+        String taskType = String.valueOf(task.get("type"));
+        JsonNode response = postCaptchaJson("/createTask", body, "createTask", taskType, 0, true, true);
         int errorId = response.path("errorId").asInt(-1);
         if (errorId != 0) {
             throw new IllegalStateException("createTask errorId=" + errorId
@@ -495,6 +603,8 @@ public class TwoCaptchaClient {
             throw new IllegalStateException("createTask: пустой taskId");
         }
         log.info("2Captcha: задача Yandex SmartCaptcha создана, taskId={}, type={}", taskId, task.get("type"));
+        CaptchaVendorLog.vendorRequest(normalizedApiBase(), "createTask", taskType, taskId,
+                "websiteURL + websiteKey → ожидаем smart-token для Yandex SmartCaptcha");
         return taskId;
     }
 
@@ -512,10 +622,10 @@ public class TwoCaptchaClient {
         body.put("task", task);
 
         log.info("2Captcha: createTask PazlCaptchaTask → {} clientKey={} imageLen={} taskLen={} languagePool=ru taskPreview={}",
-                CREATE_TASK_URL, maskClientKey(clientKey), imageBase64.length(), taskJson.length(),
+                apiUrl("/createTask"), maskClientKey(clientKey), imageBase64.length(), taskJson.length(),
                 summarizeTaskArray(taskJson));
 
-        JsonNode response = postJson(CREATE_TASK_URL, body);
+        JsonNode response = postCaptchaJson("/createTask", body, "createTask", "PazlCaptchaTask", 0, true, true);
         int errorId = response.path("errorId").asInt(-1);
         if (errorId != 0) {
             throw new IllegalStateException("createTask PazlCaptcha errorId=" + errorId
@@ -527,6 +637,8 @@ public class TwoCaptchaClient {
             throw new IllegalStateException("createTask PazlCaptcha: пустой taskId");
         }
         log.info("2Captcha: задача PazlCaptcha создана, taskId={}", taskId);
+        CaptchaVendorLog.vendorRequest(normalizedApiBase(), "createTask", "PazlCaptchaTask", taskId,
+                "image PNG base64 + task JSON (калейдоскоп Яндекс)");
         return taskId;
     }
 
@@ -559,18 +671,31 @@ public class TwoCaptchaClient {
         }
     }
 
-    /** Сообщить 2Captcha о неверном solution (coordinates вместо кликов). Ошибки глушим. */
     private void reportIncorrectQuiet(long taskId) {
         try {
             Map<String, Object> body = Map.of(
                     "clientKey", effectiveApiKey(),
                     "taskId", taskId
             );
-            JsonNode response = postJson("https://api.2captcha.com/reportIncorrect", body);
-            log.info("2Captcha: reportIncorrect taskId={} errorId={}",
-                    taskId, response.path("errorId").asInt(-1));
+            JsonNode response = postCaptchaJson("/reportIncorrect", body, "reportIncorrect", "", taskId, true, true);
+            log.info("2Captcha: reportIncorrect taskId={} errorId={} status={}",
+                    taskId, response.path("errorId").asInt(-1), response.path("status").asText(""));
         } catch (Exception e) {
             log.debug("2Captcha: reportIncorrect taskId={}: {}", taskId, e.getMessage());
+        }
+    }
+
+    private void reportCorrectQuiet(long taskId) {
+        try {
+            Map<String, Object> body = Map.of(
+                    "clientKey", effectiveApiKey(),
+                    "taskId", taskId
+            );
+            JsonNode response = postCaptchaJson("/reportCorrect", body, "reportCorrect", "", taskId, true, true);
+            log.info("2Captcha: reportCorrect taskId={} errorId={} status={}",
+                    taskId, response.path("errorId").asInt(-1), response.path("status").asText(""));
+        } catch (Exception e) {
+            log.debug("2Captcha: reportCorrect taskId={}: {}", taskId, e.getMessage());
         }
     }
 
@@ -591,9 +716,9 @@ public class TwoCaptchaClient {
         body.put("clientKey", clientKey);
         body.put("task", task);
 
-        log.info("2Captcha: createTask hCaptcha → {} clientKey={}", CREATE_TASK_URL, maskClientKey(clientKey));
+        log.info("2Captcha: createTask hCaptcha → {} clientKey={}", apiUrl("/createTask"), maskClientKey(clientKey));
 
-        JsonNode response = postJson(CREATE_TASK_URL, body);
+        JsonNode response = postCaptchaJson("/createTask", body, "createTask", "HCaptchaTaskProxyless", 0, true, true);
         int errorId = response.path("errorId").asInt(-1);
         if (errorId != 0) {
             throw new IllegalStateException("createTask errorId=" + errorId
@@ -611,6 +736,7 @@ public class TwoCaptchaClient {
     private Optional<String> pollTaskResult(long taskId, String captchaKind) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMs;
         int pollAttempt = 0;
+        String taskTypeForLog = taskTypeLabel(captchaKind);
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(pollIntervalMs);
             pollAttempt++;
@@ -621,7 +747,9 @@ public class TwoCaptchaClient {
             );
             JsonNode response;
             try {
-                response = postJson(GET_RESULT_URL, body);
+                boolean logExchange = pollAttempt == 1;
+                response = postCaptchaJson("/getTaskResult", body, "getTaskResult", taskTypeForLog, taskId,
+                        logExchange, logExchange);
             } catch (RestClientException e) {
                 log.warn("2Captcha: ошибка getTaskResult для taskId={}: {}", taskId, e.getMessage());
                 continue;
@@ -644,6 +772,9 @@ public class TwoCaptchaClient {
                 continue;
             }
             if ("ready".equalsIgnoreCase(status)) {
+                if (pollAttempt > 1) {
+                    logCaptchaJsonExchange("/getTaskResult", "getTaskResult", taskTypeForLog, taskId, body, response);
+                }
                 // PazlCaptcha: solution = "8" | объект | coordinates
                 JsonNode solutionNode = response.get("solution");
                 Optional<String> token = Optional.empty();
@@ -688,10 +819,28 @@ public class TwoCaptchaClient {
                 }
                 // Полный ответ 2Captcha (для Pazl — solution целиком; для токенов — без обрезки длины)
                 if ("PazlCaptcha".equals(captchaKind)) {
-                    log.info("2Captcha: PazlCaptcha ready taskId={} fullResponse={}", taskId, response);
+                    String rawJson = response.toString();
+                    log.info("2Captcha: PazlCaptcha ready taskId={} fullResponse={}", taskId, rawJson);
                     log.info("2Captcha: PazlCaptcha solution={}", token.get());
+                    CaptchaVendorLog.vendorResponse(normalizedApiBase(), "PazlCaptchaTask", taskId, token.get(),
+                            CaptchaVendorLog.interpretPazlRaw(token.get()),
+                            "пока никто — решает YandexKaleidoscopeSolver (клики слайдера)");
+                } else if ("AudioTask".equals(captchaKind)) {
+                    log.info("2Captcha: AudioTask ready taskId={}, textLen={}", taskId, token.get().length());
+                    CaptchaVendorLog.vendorResponse(normalizedApiBase(), "AudioTask", taskId, token.get(),
+                            "текст ответа audio challenge",
+                            "YandexSmartCaptchaAudioSolver → поле ввода в iframe");
                 } else {
-                    log.info("2Captcha: {} решена, taskId={}, tokenLen={}", captchaKind, taskId, token.get().length());
+                    log.info(
+                            "2Captcha: {} getTaskResult=ready (токен от воркера, НЕ значит что YouDo принял капчу), taskId={}, tokenLen={}",
+                            captchaKind, taskId, token.get().length());
+                    String taskType = captchaKind.contains("proxy") && !captchaKind.contains("proxyless")
+                            ? "YandexSmartCaptchaTask"
+                            : "YandexSmartCaptchaTaskProxyless";
+                    CaptchaVendorLog.vendorResponse(normalizedApiBase(), taskType, taskId,
+                            "smart-token, длина=" + token.get().length() + " символов",
+                            "ДА — вставка в поле smart-token на youdo.com",
+                            "наш код CaptchaService.applyYandexSmartCaptchaToken");
                 }
                 return token;
             }
@@ -720,7 +869,134 @@ public class TwoCaptchaClient {
         return Optional.empty();
     }
 
-    private JsonNode postJson(String url, Map<String, Object> body) {
+    /** Для лога: полный JSON getTaskResult, token в solution заменён на &lt;redacted len=N&gt;. */
+    private static String redactSmartTokenInJson(JsonNode response) {
+        if (response == null) {
+            return "";
+        }
+        try {
+            JsonNode copy = response.deepCopy();
+            JsonNode sol = copy.get("solution");
+            if (sol != null && sol.isObject() && sol.has("token")) {
+                String t = sol.get("token").asText("");
+                ((com.fasterxml.jackson.databind.node.ObjectNode) sol).put("token",
+                        "<redacted len=" + t.length() + ">");
+            } else if (sol != null && sol.isTextual()) {
+                String t = sol.asText("");
+                if (t.length() > 40) {
+                    ((com.fasterxml.jackson.databind.node.ObjectNode) copy).put("solution",
+                            "<redacted len=" + t.length() + ">");
+                }
+            }
+            return copy.toString();
+        } catch (Exception e) {
+            return response.toString();
+        }
+    }
+
+    private static String taskTypeLabel(String captchaKind) {
+        if (captchaKind == null) {
+            return "";
+        }
+        if ("PazlCaptcha".equals(captchaKind)) {
+            return "PazlCaptchaTask";
+        }
+        if (captchaKind.contains("Audio")) {
+            return "AudioTask";
+        }
+        if ("hCaptcha".equalsIgnoreCase(captchaKind)) {
+            return "HCaptchaTaskProxyless";
+        }
+        if (captchaKind.contains("proxy") && !captchaKind.contains("proxyless")) {
+            return "YandexSmartCaptchaTask";
+        }
+        return "YandexSmartCaptchaTaskProxyless";
+    }
+
+    private JsonNode postCaptchaJson(String path, Map<String, Object> body, String apiMethod, String taskType,
+                                     long taskId, boolean logSend, boolean logReceive) {
+        if (logSend) {
+            CaptchaVendorLog.vendorJsonSend(normalizedApiBase(), path, apiMethod, taskType, taskId,
+                    toLogRequestJson(body));
+        }
+        JsonNode response = postJsonInternal(apiUrl(path), body);
+        if (logReceive) {
+            CaptchaVendorLog.vendorJsonReceive(normalizedApiBase(), path, apiMethod, taskType,
+                    taskId > 0 ? taskId : response.path("taskId").asLong(0), toLogResponseJson(response));
+        }
+        return response;
+    }
+
+    private void logCaptchaJsonExchange(String path, String apiMethod, String taskType, long taskId,
+                                        Map<String, Object> requestBody, JsonNode response) {
+        CaptchaVendorLog.vendorJsonSend(normalizedApiBase(), path, apiMethod, taskType, taskId,
+                toLogRequestJson(requestBody));
+        CaptchaVendorLog.vendorJsonReceive(normalizedApiBase(), path, apiMethod, taskType, taskId,
+                toLogResponseJson(response));
+    }
+
+    private String toLogRequestJson(Map<String, Object> body) {
+        try {
+            return objectMapper.writeValueAsString(sanitizeBodyForLog(body));
+        } catch (Exception e) {
+            return String.valueOf(body);
+        }
+    }
+
+    private String toLogResponseJson(JsonNode response) {
+        if (response == null) {
+            return "";
+        }
+        String status = response.path("status").asText("");
+        if ("ready".equalsIgnoreCase(status)) {
+            return redactSmartTokenInJson(response);
+        }
+        return response.toString();
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> sanitizeBodyForLog(Map<String, Object> body) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> e : body.entrySet()) {
+            String key = e.getKey();
+            Object val = e.getValue();
+            if ("clientKey".equals(key)) {
+                out.put(key, maskClientKey(val == null ? "" : String.valueOf(val)));
+            } else if ("task".equals(key) && val instanceof Map) {
+                out.put(key, sanitizeTaskForLog((Map<String, Object>) val));
+            } else {
+                out.put(key, val);
+            }
+        }
+        return out;
+    }
+
+    private Map<String, Object> sanitizeTaskForLog(Map<String, Object> task) {
+        Map<String, Object> t = new LinkedHashMap<>(task);
+        replaceWithLenPlaceholder(t, "image");
+        replaceWithLenPlaceholder(t, "body");
+        if (t.containsKey("proxyPassword")) {
+            t.put("proxyPassword", "***");
+        }
+        if (t.containsKey("cookies")) {
+            String c = String.valueOf(t.get("cookies"));
+            if (c.length() > 160) {
+                t.put("cookies", c.substring(0, 160) + "…(len=" + c.length() + ")");
+            }
+        }
+        return t;
+    }
+
+    private static void replaceWithLenPlaceholder(Map<String, Object> task, String field) {
+        if (!task.containsKey(field)) {
+            return;
+        }
+        Object v = task.get(field);
+        int len = v == null ? 0 : String.valueOf(v).length();
+        task.put(field, "<base64 len=" + len + ">");
+    }
+
+    private JsonNode postJsonInternal(String url, Map<String, Object> body) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);

@@ -1,4 +1,4 @@
-package by.gdev.common.service.playwright.flru;
+package by.gdev.alert.job.parser.service.order;
 
 import by.gdev.common.model.SiteName;
 import by.gdev.common.service.playwright.captcha.CaptchaService;
@@ -7,14 +7,10 @@ import com.microsoft.playwright.Page;
 
 import java.util.Locale;
 
-/** Эвристики страниц FL.ru (защита от ботов / DDoS / блок IP). */
+/** Эвристики FL.ru для {@link FLOrderParser} / {@link by.gdev.alert.job.parser.service.category.FLCategoryParser}. */
 public final class FlRuPlaywrightGuards {
 
-    /** Подстрока в тексте ошибки для retry — без hardcode имени сайта в проверке. */
     public static final String DDOS_RETRY_FAIL_MARKER = "не удалось открыть страницу логина";
-
-    /** Заголовок страницы FL.ru «сайт на техобслуживании». */
-    public static final String SITE_MAINTENANCE_MARKER = "На сайте проводятся технические работы";
 
     private static final String SUSPICIOUS_IP_ACTIVITY_MARKER = "подозрительная активность";
 
@@ -30,32 +26,6 @@ public final class FlRuPlaywrightGuards {
             return false;
         }
         return containsSuspiciousIpActivityText(htmlOrText.toLowerCase(Locale.ROOT));
-    }
-
-    public static boolean isSiteMaintenancePage(Page page) {
-        if (page == null) {
-            return false;
-        }
-        try {
-            Locator heading = page.locator("h1").first();
-            if (heading.count() > 0 && heading.isVisible()) {
-                String h1 = heading.innerText();
-                if (h1 != null && h1.contains(SITE_MAINTENANCE_MARKER)) {
-                    return true;
-                }
-            }
-            Locator layout = page.locator("table.body-wrap").first();
-            if (layout.count() > 0) {
-                String wrapText = layout.innerText();
-                if (wrapText != null && wrapText.contains(SITE_MAINTENANCE_MARKER)) {
-                    return true;
-                }
-            }
-            String bodyText = page.locator("body").innerText();
-            return bodyText != null && bodyText.contains(SITE_MAINTENANCE_MARKER);
-        } catch (RuntimeException ignored) {
-            return false;
-        }
     }
 
     public static boolean isSuspiciousIpActivityBlock(Page page) {
@@ -83,9 +53,6 @@ public final class FlRuPlaywrightGuards {
 
     public static boolean isAntiDdosOrBotWall(Page page, CaptchaService captchaService) {
         try {
-            if (isLikelyAuthenticatedFlRuPage(page)) {
-                return false;
-            }
             if (isSuspiciousIpActivityBlock(page)) {
                 return true;
             }
@@ -101,9 +68,6 @@ public final class FlRuPlaywrightGuards {
             String html = page.content().toLowerCase(Locale.ROOT);
             if (html.contains("ddos-guard") || html.contains("ddguard")) {
                 return true;
-            }
-            if (!looksLikeBlockingChallengePage(page)) {
-                return false;
             }
             String text = page.locator("body").innerText().toLowerCase(Locale.ROOT);
             if (text.contains("ddos-guard") || text.contains("distributed denial")) {
@@ -121,46 +85,7 @@ public final class FlRuPlaywrightGuards {
                 return true;
             }
         } catch (RuntimeException ignored) {
-            // страница в переходе — ниже по таймауту поля логина решим отдельно
         }
         return false;
-    }
-
-    public static boolean isLikelyAuthenticatedFlRuPage(Page page) {
-        try {
-            String url = page.url().toLowerCase(Locale.ROOT);
-            if (url.contains("/account/login")) {
-                return false;
-            }
-            String[] loggedInSelectors = {
-                    "a[href*='/account/logout']",
-                    "a[href*='logout.php']",
-                    "a[href*='/users/'][href$='.html']",
-                    ".header-user-menu",
-                    "a[href='/account/']",
-                    "a[href*='/account/?']",
-            };
-            for (String selector : loggedInSelectors) {
-                Locator loc = page.locator(selector);
-                if (loc.count() > 0 && loc.first().isVisible()) {
-                    return true;
-                }
-            }
-        } catch (RuntimeException ignored) {
-        }
-        return false;
-    }
-
-    private static boolean looksLikeBlockingChallengePage(Page page) {
-        try {
-            String url = page.url().toLowerCase(Locale.ROOT);
-            if (url.contains("/account/login")) {
-                return true;
-            }
-            String text = page.locator("body").innerText();
-            return text != null && text.length() < 6000;
-        } catch (RuntimeException e) {
-            return true;
-        }
     }
 }

@@ -1,9 +1,9 @@
 package by.gdev.alert.job.notification.service.ai.recovery;
 
 import by.gdev.alert.job.notification.service.ai.metrics.errors.AutoreplyErrorTypes;
+import by.gdev.alert.job.notification.service.ai.parser.impl.flru.FlRuPlaywrightGuards;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepResult;
 import by.gdev.alert.job.notification.service.ai.queue.step.dto.StepType;
-import by.gdev.common.service.playwright.flru.FlRuPlaywrightGuards;
 
 import java.util.Locale;
 import java.util.Set;

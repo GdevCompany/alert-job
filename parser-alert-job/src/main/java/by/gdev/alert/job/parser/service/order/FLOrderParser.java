@@ -10,7 +10,6 @@ import by.gdev.alert.job.parser.domain.rss.Rss;
 import by.gdev.common.model.OrderDTO;
 import by.gdev.common.model.SiteName;
 import by.gdev.common.model.proxy.ProxyCredentials;
-import by.gdev.common.service.playwright.flru.FlRuPlaywrightGuards;
 import by.gdev.alert.job.parser.service.order.jsoup.JsoupClient;
 import jakarta.xml.bind.JAXBContext;
 import jakarta.xml.bind.UnmarshalException;

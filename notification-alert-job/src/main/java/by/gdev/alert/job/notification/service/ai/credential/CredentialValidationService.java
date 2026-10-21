@@ -16,16 +16,33 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.concurrent.ConcurrentHashMap;
+
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class CredentialValidationService {
+
+    private static final ConcurrentHashMap<String, Object> VALIDATION_LOCKS = new ConcurrentHashMap<>();
 
     private final AutoreplyParserFactory parserFactory;
     private final UserCredentialService userCredentialService;
 
     public CredentialValidationResult validate(String uuid, Long siteId, String login, String password,
                                                String userEmail) {
+        String lockKey = uuid + ":" + siteId + ":" + (login != null ? login.trim().toLowerCase() : "");
+        Object lock = VALIDATION_LOCKS.computeIfAbsent(lockKey, k -> new Object());
+        synchronized (lock) {
+            try {
+                return validateInternal(uuid, siteId, login, password, userEmail);
+            } finally {
+                VALIDATION_LOCKS.remove(lockKey, lock);
+            }
+        }
+    }
+
+    private CredentialValidationResult validateInternal(String uuid, Long siteId, String login, String password,
+                                                        String userEmail) {
         SiteName siteName;
         try {
             siteName = SiteName.fromId(siteId);
