@@ -1224,9 +1224,8 @@ public class CaptchaService {
             } else {
                 log.info("SmartCaptcha/YouDo: Pazl не прошёл — пробуем AudioTask");
             }
-            java.util.ArrayList<String> voiceSeeds = new java.util.ArrayList<>();
-            kaleidoscopeSolver.getLastVoiceUrl(page).ifPresent(voiceSeeds::add);
-            ok = yandexAudioSolver.solve(page, voiceSeeds);
+            // voice из /check на калейдоскопе — не аудио-задание; только после challenge-type + voice?key=
+            ok = yandexAudioSolver.solve(page);
             log.info("SmartCaptcha/YouDo: AudioTask после Pazl → {}", ok ? "ok" : "не снято");
         }
         if (ok && isYandexSmartCaptchaAcceptedByWidget(page)) {

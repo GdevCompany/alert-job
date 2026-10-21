@@ -20,12 +20,15 @@ public class YouDoBrowserGuards {
             try {
                 String message = dialog.message() != null ? dialog.message() : "";
                 log.info("YOUDO dialog: type={} message={}", dialog.type(), truncate(message));
-                if ("beforeunload".equalsIgnoreCase(dialog.type())
-                        || message.contains("изменен")
+                // beforeunload: dismiss = нельзя закрыть вкладку; accept = закрыть (нужно пользователю и Stop в IDE).
+                if ("beforeunload".equalsIgnoreCase(dialog.type())) {
+                    dialog.accept();
+                    log.info("YOUDO dialog: accept beforeunload — разрешаем закрыть вкладку/браузер");
+                } else if (message.contains("изменен")
                         || message.contains("Изменен")
                         || message.toLowerCase().contains("changes")) {
                     dialog.dismiss();
-                    log.info("YOUDO dialog: dismiss — остаёмся на странице («Продолжить изменения»)");
+                    log.info("YOUDO dialog: dismiss — остаёмся на странице");
                 } else {
                     dialog.accept();
                 }

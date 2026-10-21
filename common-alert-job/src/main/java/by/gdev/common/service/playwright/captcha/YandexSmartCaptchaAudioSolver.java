@@ -1,9 +1,13 @@
 package by.gdev.common.service.playwright.captcha;
 
+import by.gdev.common.service.playwright.debug.PlaywrightCdpDebugSink;
+import com.microsoft.playwright.ElementHandle;
 import com.microsoft.playwright.Frame;
 import com.microsoft.playwright.Locator;
+import com.microsoft.playwright.Mouse;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.Response;
+import com.microsoft.playwright.options.BoundingBox;
 import com.microsoft.playwright.options.RequestOptions;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -16,17 +20,21 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
 /**
  * Yandex SmartCaptcha audio challenge → 2Captcha {@link TwoCaptchaClient#solveAudioCaptcha}.
- * Аудио скачивается через APIRequestContext (не {@code response.body()} в onResponse — deadlock).
+ * Аудио: voice URL в onResponse, скачивание только на потоке solve (не request в onResponse — deadlock).
  */
 @Component
 @Slf4j
 @RequiredArgsConstructor
 public class YandexSmartCaptchaAudioSolver {
+
+    /** Маркер в логе: убедиться, что notification подхватил свежий common-alert-job после Stop→Run. */
+    private static final String SOLVER_BUILD = "2026-03-21-no-kaleido-seed";
 
     private static final Pattern MP3_URL = Pattern.compile("\\.mp3([?#]|$)", Pattern.CASE_INSENSITIVE);
 
@@ -118,6 +126,25 @@ public class YandexSmartCaptchaAudioSolver {
         }
     }
 
+    /** Калейдоскоп/слайдер — seed voice из /check не тот трек, нужен клик challenge-type и новый voice?key=. */
+    private static boolean isKaleidoscopeChallengeInFrame(Frame frame) {
+        try {
+            Locator canvas = frame.locator(
+                    ".AdvancedCaptcha-KaleidoscopeCanvas, canvas.AdvancedCaptcha-KaleidoscopeCanvas");
+            if (canvas.count() > 0 && isVisibleQuick(canvas.first())) {
+                return true;
+            }
+            Locator slider = frame.locator("#captcha-slider");
+            return slider.count() > 0 && isVisibleQuick(slider.first());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static boolean isDedicatedAudioChallenge(Frame frame) {
+        return isAudioFormVisibleInFrame(frame) && !isKaleidoscopeChallengeInFrame(frame);
+    }
+
     private static boolean isVisibleQuick(Locator locator) {
         try {
             return locator.isVisible(new Locator.IsVisibleOptions().setTimeout(UI_PROBE_TIMEOUT_MS));
@@ -156,20 +183,16 @@ public class YandexSmartCaptchaAudioSolver {
                 }
             }
         }
-        Consumer<Response> listener = captureAudioUrls(capturedUrls);
+        AtomicReference<byte[]> mp3FromIntercept = new AtomicReference<>();
+        Consumer<Response> listener = captureAudioUrls(page, capturedUrls, mp3FromIntercept);
         page.context().onResponse(listener);
         try {
+            log.info("SmartCaptcha audio: solver build {}", SOLVER_BUILD);
             for (int round = 1; round <= 2; round++) {
                 log.info("SmartCaptcha audio: раунд {}/2", round);
                 if (round > 1) {
                     capturedUrls.clear();
-                    if (seedVoiceUrls != null) {
-                        for (String u : seedVoiceUrls) {
-                            if (u != null && !u.isBlank()) {
-                                capturedUrls.add(u);
-                            }
-                        }
-                    }
+                    mp3FromIntercept.set(null);
                 }
                 Optional<Frame> frameOpt = findAdvancedFrame(page);
                 if (frameOpt.isEmpty()) {
@@ -179,51 +202,56 @@ public class YandexSmartCaptchaAudioSolver {
                 }
                 Frame frame = frameOpt.get();
                 log.info("SmartCaptcha audio: frame url={}", truncate(safeUrl(frame), 100));
-                log.info("SmartCaptcha audio: voice urls на старте раунда: {}",
-                        voiceUrlsPreview(capturedUrls));
-
-                if (!isAudioFormVisibleInFrame(frame)) {
-                    log.info("SmartCaptcha audio: СНАЧАЛА клик «Изменить тип задания» (challenge-type)");
-                    openAudioFormForInput(frame, page, capturedUrls, 12_000);
+                if (Boolean.parseBoolean(System.getenv().getOrDefault("PLAYWRIGHT_DEBUG_MARKUP", "false"))) {
+                    PlaywrightCdpDebugSink.publishSmartCaptcha(page, frame, "audio-round-" + round + "-start");
                 }
+                expandVoiceUrlsInSink(capturedUrls);
+                boolean kaleidoscope = isKaleidoscopeChallengeInFrame(frame);
+                if (kaleidoscope && !capturedUrls.isEmpty()) {
+                    log.info(
+                            "SmartCaptcha audio: калейдоскоп — очищаем {} seed URL (нужен challenge-type)",
+                            capturedUrls.size());
+                    capturedUrls.clear();
+                    mp3FromIntercept.set(null);
+                }
+                log.info("SmartCaptcha audio: voice urls (seed): {}", voiceUrlsPreview(capturedUrls));
 
                 byte[] mp3 = null;
-                if (!pickBestVoiceUrl(capturedUrls).isEmpty()) {
-                    log.info("SmartCaptcha audio: скачивание mp3 (seed/перехват)");
-                    mp3 = guaranteedDownloadVoice(page, frame, capturedUrls);
-                }
-                if (mp3 == null || mp3.length < 200) {
-                    switchToAudioDomOnly(frame, page);
-                    page.waitForTimeout(400);
-                    if (pickBestVoiceUrl(capturedUrls).isEmpty()) {
-                        log.info("SmartCaptcha audio: voice URL нет — play + короткое ожидание");
-                        clickPlay(frame, page);
-                        waitForVoiceUrl(page, capturedUrls, 4_000);
-                        log.info("SmartCaptcha audio: urls после play: count={} preview={}",
-                                capturedUrls.size(), voiceUrlsPreview(capturedUrls));
+                boolean dedicatedAudio = isDedicatedAudioChallenge(frame);
+                if (!kaleidoscope && dedicatedAudio) {
+                    mp3 = tryDownloadMp3(page, frame, capturedUrls, mp3FromIntercept);
+                    if (mp3 != null && mp3.length >= 200) {
+                        log.info("SmartCaptcha audio: mp3 в аудио-режиме (без калейдоскопа), {} bytes",
+                                mp3.length);
                     }
-                    mp3 = guaranteedDownloadVoice(page, frame, capturedUrls);
                 }
                 if (mp3 == null || mp3.length < 200) {
-                    log.warn("SmartCaptcha audio: повтор после play (round={})", round);
-                    clickPlay(frame, page);
-                    page.waitForTimeout(1500);
-                    waitForVoiceUrl(page, capturedUrls, 5_000);
-                    mp3 = guaranteedDownloadVoice(page, frame, capturedUrls);
+                    if (kaleidoscope) {
+                        log.info("SmartCaptcha audio: калейдоскоп — seed не используем, жмём challenge-type");
+                    }
+                    log.info("SmartCaptcha audio: [1/3] переключение на аудио (dedicatedAudio={})",
+                            dedicatedAudio);
+                    if (!dedicatedAudio) {
+                        if (!clickChallengeTypeButton(frame, page)) {
+                            log.warn("SmartCaptcha audio: challenge-type не нажата (round={})", round);
+                        }
+                        briefPauseForVoiceUrl(page, capturedUrls, 2_000);
+                    }
+                    log.info("SmartCaptcha audio: [2/3] скачивание mp3 по voice URL");
+                    mp3 = resolveMp3WithRetries(page, frame, capturedUrls, mp3FromIntercept, 3);
                 }
                 if (mp3 == null || mp3.length < 200) {
-                    log.error(
-                            "SmartCaptcha audio: mp3 НЕ скачан — AudioTask НЕ отправлен (round={}, urls={})",
-                            round, voiceUrlsPreview(capturedUrls));
+                    log.error("SmartCaptcha audio: mp3 не скачан — 2Captcha не вызываем (round={})",
+                            round);
                     continue;
                 }
                 if (mp3.length > 1_000_000) {
                     log.warn("SmartCaptcha audio: файл > 1 MB, пропуск");
                     continue;
                 }
-                log.info("SmartCaptcha audio: mp3 bytes={} → ОБЯЗАТЕЛЬНАЯ отправка AudioTask в 2Captcha",
-                        mp3.length);
 
+                log.info("SmartCaptcha audio: [3/3] отправка в 2Captcha AudioTask, mp3={} bytes",
+                        mp3.length);
                 Optional<TwoCaptchaClient.AudioResult> audioResult =
                         twoCaptchaClient.solveAudioCaptcha(mp3, "ru");
                 if (audioResult.isEmpty()) {
@@ -245,8 +273,9 @@ public class YandexSmartCaptchaAudioSolver {
                 log.info("SmartCaptcha audio: ответ 2Captcha → «{}» (digits len={})",
                         maskAnswer(answer), answer.length());
 
-                if (!openAudioFormForInput(frame, page, capturedUrls, 15_000)) {
-                    log.warn("SmartCaptcha audio: не открыли аудио-форму (input[name=rep]) перед вводом");
+                if (!isAudioFormVisibleInFrame(frame)) {
+                    log.warn("SmartCaptcha audio: после 2Captcha нет поля rep — ждём UI");
+                    page.waitForTimeout(1_500);
                 }
                 if (!submitAnswer(frame, page, answer)) {
                     log.warn("SmartCaptcha audio: не удалось ввести/отправить ответ (rep visible={})",
@@ -270,39 +299,59 @@ public class YandexSmartCaptchaAudioSolver {
         }
     }
 
-    /**
-     * Скачать mp3 по URL из перехвата (сессия браузера), без {@code Response#body()} в CDP.
-     */
-    /**
-     * Если voice URL есть в списке — всегда делаем несколько попыток скачать (без тихого пропуска).
-     */
-    private byte[] guaranteedDownloadVoice(Page page, Frame frame, List<String> urlSink) {
-        expandVoiceUrlsInSink(urlSink);
-        if (pickBestVoiceUrl(urlSink).isEmpty()) {
-            return null;
-        }
-        for (int attempt = 1; attempt <= 5; attempt++) {
-            expandVoiceUrlsInSink(urlSink);
-            log.info("SmartCaptcha audio: скачивание попытка {}/5, urls={}",
-                    attempt, voiceUrlsPreview(urlSink));
-            byte[] mp3 = fetchVoiceMp3(page, frame, urlSink);
+    private byte[] tryDownloadMp3(Page page, Frame frame, List<String> urlSink,
+            AtomicReference<byte[]> mp3FromIntercept) {
+        return takeInterceptedOrDownload(page, frame, urlSink, mp3FromIntercept);
+    }
+
+    private byte[] resolveMp3WithRetries(Page page, Frame frame, List<String> urlSink,
+            AtomicReference<byte[]> mp3FromIntercept, int maxAttempts) {
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            byte[] mp3 = takeInterceptedOrDownload(page, frame, urlSink, mp3FromIntercept);
             if (mp3 != null && mp3.length >= 200) {
                 return mp3;
             }
-            page.waitForTimeout(350L * attempt);
+            log.warn("SmartCaptcha audio: mp3 попытка {}/{} — нет файла, urls={}",
+                    attempt, maxAttempts, voiceUrlsPreview(urlSink));
+            if (attempt < maxAttempts) {
+                tryClickPlayQuick(frame, page);
+                briefPauseForVoiceUrl(page, urlSink, 1_200);
+            }
         }
         return null;
     }
 
-    private byte[] fetchVoiceMp3(Page page, Frame frame, List<String> urlSink) {
+    private byte[] takeInterceptedOrDownload(Page page, Frame frame, List<String> urlSink,
+            AtomicReference<byte[]> mp3FromIntercept) {
+        expandVoiceUrlsInSink(urlSink);
+        byte[] cached = mp3FromIntercept.get();
+        if (cached != null && cached.length >= 200) {
+            log.info("SmartCaptcha audio: mp3 уже в буфере, {} bytes", cached.length);
+            return cached;
+        }
+        byte[] downloaded = downloadVoiceByUrl(page, frame, urlSink);
+        if (downloaded != null && downloaded.length >= 200) {
+            mp3FromIntercept.compareAndSet(null, downloaded);
+        }
+        return downloaded;
+    }
+
+    /** Скачать mp3 по ссылке voice из /check или перехвата (без циклов ожидания UI). */
+    private byte[] downloadVoiceByUrl(Page page, Frame frame, List<String> urlSink) {
+        expandVoiceUrlsInSink(urlSink);
+        if (pickBestVoiceUrl(urlSink).isEmpty()) {
+            log.warn("SmartCaptcha audio: нет voice URL для скачивания");
+            return null;
+        }
         for (String url : voiceUrlsOrdered(urlSink)) {
-            String direct = url.contains("voice?key=") ? truncate(url, 120) : truncate(url, 100);
-            log.info("SmartCaptcha audio: скачиваем voice url={}", direct);
+            log.info("SmartCaptcha audio: скачивание по ссылке {}", truncate(url, 120));
             Optional<byte[]> bytes = downloadVoiceBytes(page, frame, url);
-            if (bytes.isPresent()) {
+            if (bytes.isPresent() && bytes.get().length >= 200) {
+                log.info("SmartCaptcha audio: mp3 скачан, {} bytes", bytes.get().length);
                 return bytes.get();
             }
         }
+        log.warn("SmartCaptcha audio: ни одна ссылка не дала mp3, urls={}", voiceUrlsPreview(urlSink));
         return null;
     }
 
@@ -321,57 +370,6 @@ public class YandexSmartCaptchaAudioSolver {
                 log.info("SmartCaptcha audio: voice URL распакован → {}", truncate(inner, 100));
             }
         }
-    }
-
-    private void waitForVoiceUrl(Page page, List<String> urlSink, int maxWaitMs) {
-        int step = 250;
-        int attempts = Math.max(1, maxWaitMs / step);
-        for (int i = 0; i < attempts; i++) {
-            if (!pickBestVoiceUrl(urlSink).isEmpty()) {
-                return;
-            }
-            page.waitForTimeout(step);
-        }
-    }
-
-    /**
-     * Калейдоскоп → аудио: кнопка {@code data-testid=challenge-type} («Изменить тип задания»), затем {@code input[name=rep]}.
-     */
-    private boolean openAudioFormForInput(Frame frame, Page page, List<String> capturedUrls, int maxWaitMs) {
-        if (isAudioFormVisibleInFrame(frame)) {
-            log.info("SmartCaptcha audio: аудио-форма уже видна (rep/play)");
-            return true;
-        }
-        long deadline = System.currentTimeMillis() + maxWaitMs;
-        int clickRound = 0;
-        while (System.currentTimeMillis() < deadline) {
-            clickRound++;
-            log.info("SmartCaptcha audio: клик challenge-type (раунд {})", clickRound);
-            if (clickChallengeTypeButton(frame, page)) {
-                page.waitForTimeout(500);
-                if (isAudioFormVisibleInFrame(frame)) {
-                    log.info("SmartCaptcha audio: аудио-форма открыта после challenge-type (раунд {})", clickRound);
-                    return true;
-                }
-                if (hasDirectVoiceKeyUrl(capturedUrls)) {
-                    log.info("SmartCaptcha audio: voice?key= после challenge-type — не ждём rep в цикле (раунд {})",
-                            clickRound);
-                    waitForVoiceUrl(page, capturedUrls, 1_500);
-                    page.waitForTimeout(600);
-                    if (isAudioFormVisibleInFrame(frame)) {
-                        return true;
-                    }
-                    return false;
-                }
-            }
-            waitForVoiceUrl(page, capturedUrls, 600);
-            page.waitForTimeout(350);
-        }
-        boolean ok = isAudioFormVisibleInFrame(frame);
-        if (!ok) {
-            log.warn("SmartCaptcha audio: rep не появился за {} ms (кликов challenge-type={})", maxWaitMs, clickRound);
-        }
-        return ok;
     }
 
     private static String voiceUrlsPreview(List<String> urls) {
@@ -472,9 +470,11 @@ public class YandexSmartCaptchaAudioSolver {
             if (candidate == null || candidate.isBlank()) {
                 continue;
             }
-            Optional<byte[]> viaBrowser = fetchVoiceInBrowser(frame, candidate);
-            if (viaBrowser.isPresent()) {
-                return viaBrowser;
+            if (candidate.contains("voice?key=")) {
+                Optional<byte[]> viaBrowser = fetchVoiceInBrowser(frame, candidate);
+                if (viaBrowser.isPresent()) {
+                    return viaBrowser;
+                }
             }
             Optional<byte[]> viaApi = fetchUrl(page, frame, candidate);
             if (viaApi.isPresent()) {
@@ -492,7 +492,16 @@ public class YandexSmartCaptchaAudioSolver {
             Object raw = frame.evaluate(
                     """
                             async (voiceUrl) => {
-                              const r = await fetch(voiceUrl, { credentials: 'include', cache: 'no-store' });
+                              const ctrl = new AbortController();
+                              const t = setTimeout(() => ctrl.abort(), 12000);
+                              let r;
+                              try {
+                                r = await fetch(voiceUrl, {
+                                  credentials: 'include', cache: 'no-store', signal: ctrl.signal
+                                });
+                              } finally {
+                                clearTimeout(t);
+                              }
                               if (!r.ok) return { ok: false, status: r.status, len: 0 };
                               const buf = await r.arrayBuffer();
                               const u8 = new Uint8Array(buf);
@@ -543,7 +552,21 @@ public class YandexSmartCaptchaAudioSolver {
         return answer.charAt(0) + "***" + answer.charAt(answer.length() - 1);
     }
 
-    /** Только цифры из ответа 2Captcha; ровно 4 — иначе пусто (повтор / reportIncorrect). */
+    private static final java.util.Map<String, String> RU_NUM_WORD = java.util.Map.ofEntries(
+            java.util.Map.entry("ноль", "0"),
+            java.util.Map.entry("один", "1"),
+            java.util.Map.entry("одна", "1"),
+            java.util.Map.entry("два", "2"),
+            java.util.Map.entry("две", "2"),
+            java.util.Map.entry("три", "3"),
+            java.util.Map.entry("четыре", "4"),
+            java.util.Map.entry("пять", "5"),
+            java.util.Map.entry("шесть", "6"),
+            java.util.Map.entry("семь", "7"),
+            java.util.Map.entry("восемь", "8"),
+            java.util.Map.entry("девять", "9"));
+
+    /** 4 цифры: из текста 2Captcha (цифры или слова «три четыре…», мусорные слова пропускаем). */
     private static String normalizeAnswer(String raw) {
         if (raw == null) {
             return "";
@@ -551,6 +574,19 @@ public class YandexSmartCaptchaAudioSolver {
         String digitsOnly = raw.replaceAll("\\D", "");
         if (digitsOnly.length() >= 4) {
             return digitsOnly.substring(0, 4);
+        }
+        StringBuilder fromWords = new StringBuilder();
+        for (String part : raw.toLowerCase(java.util.Locale.ROOT).split("[\\s,.;:!?-]+")) {
+            if (part.isEmpty()) {
+                continue;
+            }
+            String d = RU_NUM_WORD.get(part);
+            if (d != null) {
+                fromWords.append(d);
+            }
+            if (fromWords.length() >= 4) {
+                return fromWords.substring(0, 4);
+            }
         }
         return "";
     }
@@ -599,8 +635,12 @@ public class YandexSmartCaptchaAudioSolver {
         return false;
     }
 
-    /** Только URL — никогда {@code response.body()} здесь (deadlock Playwright). */
-    private Consumer<Response> captureAudioUrls(List<String> sink) {
+    /**
+     * Только URL в sink. Скачивание — на потоке solve ({@link #takeInterceptedOrDownload}):
+     * {@code fetchUrl}/{@code request().get()} внутри onResponse даёт deadlock с {@code waitForTimeout}.
+     */
+    private Consumer<Response> captureAudioUrls(Page page, List<String> sink,
+            AtomicReference<byte[]> mp3FromIntercept) {
         return response -> {
             try {
                 String url = response.url();
@@ -610,13 +650,21 @@ public class YandexSmartCaptchaAudioSolver {
                 if (response.status() < 200 || response.status() >= 400) {
                     return;
                 }
+                String direct = unwrapLoadCaptchaVoiceUrl(url);
+                String downloadUrl = direct != null && direct.toLowerCase().contains("voice") ? direct : url;
+                if (!isChallengeVoiceUrl(downloadUrl) && !downloadUrl.toLowerCase().contains("load-captcha-voice")) {
+                    return;
+                }
                 if (!sink.contains(url)) {
                     sink.add(url);
-                    log.info("SmartCaptcha audio: URL перехват {} (скачивание после switch/wait)",
-                            truncate(url, 90));
+                    log.info("SmartCaptcha audio: voice URL {}", truncate(url, 120));
+                }
+                if (direct != null && !direct.equals(url) && !sink.contains(direct)) {
+                    sink.add(direct);
+                    log.info("SmartCaptcha audio: voice URL (direct) {}", truncate(direct, 120));
                 }
             } catch (Exception e) {
-                log.debug("SmartCaptcha audio: url capture: {}", e.getMessage());
+                log.warn("SmartCaptcha audio: перехват URL: {}", e.getMessage());
             }
         };
     }
@@ -716,8 +764,11 @@ public class YandexSmartCaptchaAudioSolver {
 
     private Optional<byte[]> fetchUrl(Page page, Frame frame, String url) {
         try {
-            String referer = safeUrl(frame);
-            var opts = RequestOptions.create().setTimeout(30_000);
+            String referer = frame != null ? safeUrl(frame) : null;
+            if (referer == null || referer.isBlank()) {
+                referer = page.url();
+            }
+            var opts = RequestOptions.create().setTimeout(8_000);
             if (referer != null && !referer.isBlank()) {
                 opts.setHeader("Referer", referer);
             }
@@ -763,17 +814,89 @@ public class YandexSmartCaptchaAudioSolver {
         page.waitForTimeout(350);
     }
 
-    /** Один клик challenge-type: сначала frameLocator на странице, без повторных Playwright-кликов (зависания). */
+    /**
+     * Реальный клик по координатам (React в iframe не реагирует на synthetic MouseEvent).
+     * Playwright locator.click с коротким timeout — запасной вариант.
+     */
     private boolean clickChallengeTypeButton(Frame frame, Page page) {
+        if (isAudioFormVisibleInFrame(frame)) {
+            log.info("SmartCaptcha audio: аудио-форма уже видна, challenge-type не нужна");
+            return true;
+        }
+        if (clickChallengeTypeViaMouse(page, frame)) {
+            return true;
+        }
         if (clickChallengeTypeViaPageIframe(page)) {
-            page.waitForTimeout(400);
             return true;
         }
         if (clickChallengeTypePlaywright(frame, page)) {
-            page.waitForTimeout(400);
             return true;
         }
         return clickChallengeTypeInDom(frame);
+    }
+
+    /** Короткая пауза, пока onResponse положит voice?key= в sink (без locator — без зависаний). */
+    private void briefPauseForVoiceUrl(Page page, List<String> capturedUrls, int maxWaitMs) {
+        int step = 80;
+        for (int waited = 0; waited < maxWaitMs; waited += step) {
+            if (hasDirectVoiceKeyUrl(capturedUrls) || pickBestVoiceUrl(capturedUrls).isPresent()) {
+                log.info("SmartCaptcha audio: voice URL в sink за {} ms", waited);
+                return;
+            }
+            page.waitForTimeout(step);
+        }
+    }
+
+    /** Клик в viewport: iframe offset + getBoundingClientRect кнопки внутри advanced frame. */
+    private boolean clickChallengeTypeViaMouse(Page page, Frame frame) {
+        try {
+            Object raw = frame.evaluate(
+                    """
+                            () => {
+                              const btn = document.querySelector('button[data-testid="challenge-type"]')
+                                || document.querySelector('button[aria-label*="Изменить тип"]');
+                              if (!btn) return { ok: false, reason: 'no-button' };
+                              const r = btn.getBoundingClientRect();
+                              if (r.width < 2 || r.height < 2) return { ok: false, reason: 'zero-size' };
+                              return {
+                                ok: true,
+                                x: r.x, y: r.y, w: r.width, h: r.height,
+                                label: (btn.getAttribute('aria-label') || '').trim().slice(0, 80)
+                              };
+                            }
+                            """);
+            if (!(raw instanceof java.util.Map<?, ?> map) || !Boolean.TRUE.equals(map.get("ok"))) {
+                log.warn("SmartCaptcha audio: mouse click — кнопка не готова ({})",
+                        raw instanceof java.util.Map<?, ?> m ? m.get("reason") : raw);
+                return false;
+            }
+            ElementHandle frameEl = frame.frameElement();
+            if (frameEl == null) {
+                log.warn("SmartCaptcha audio: mouse click — frameElement null");
+                return false;
+            }
+            BoundingBox iframeBox = frameEl.boundingBox();
+            if (iframeBox == null) {
+                log.warn("SmartCaptcha audio: mouse click — iframe boundingBox null");
+                return false;
+            }
+            double bx = ((Number) map.get("x")).doubleValue();
+            double by = ((Number) map.get("y")).doubleValue();
+            double bw = ((Number) map.get("w")).doubleValue();
+            double bh = ((Number) map.get("h")).doubleValue();
+            double cx = iframeBox.x + bx + bw / 2;
+            double cy = iframeBox.y + by + bh / 2;
+            log.info("SmartCaptcha audio: mouse click challenge-type at ({}, {}) iframe=({}, {}) label={}",
+                    Math.round(cx), Math.round(cy), Math.round(iframeBox.x), Math.round(iframeBox.y),
+                    map.get("label"));
+            page.mouse().move(cx, cy);
+            page.mouse().click(cx, cy, new Mouse.ClickOptions().setDelay(40));
+            page.waitForTimeout(450);
+            return true;
+        } catch (Exception e) {
+            log.warn("SmartCaptcha audio: mouse click challenge-type: {}", e.getMessage());
+            return false;
+        }
     }
 
     private boolean clickChallengeTypeViaPageIframe(Page page) {
@@ -781,15 +904,12 @@ public class YandexSmartCaptchaAudioSolver {
             for (String btnSel : CHALLENGE_TYPE_SELECTORS) {
                 try {
                     Locator btn = page.frameLocator(iframeSel).locator(btnSel).first();
-                    if (btn.count() == 0 || !isVisibleQuick(btn)) {
-                        continue;
-                    }
                     log.info("SmartCaptcha audio: КЛИК challenge-type iframe={} btn={}", iframeSel, btnSel);
                     btn.click(new Locator.ClickOptions()
                             .setTimeout(CHALLENGE_TYPE_CLICK_TIMEOUT_MS)
                             .setNoWaitAfter(true)
                             .setForce(true));
-                    page.waitForTimeout(450);
+                    log.info("SmartCaptcha audio: КЛИК challenge-type завершён");
                     return true;
                 } catch (Exception e) {
                     log.warn("SmartCaptcha audio: frameLocator клик {} / {}: {}", iframeSel, btnSel, e.getMessage());
@@ -834,9 +954,6 @@ public class YandexSmartCaptchaAudioSolver {
         for (String sel : CHALLENGE_TYPE_SELECTORS) {
             try {
                 Locator btn = frame.locator(sel).first();
-                if (btn.count() == 0 || !isVisibleQuick(btn)) {
-                    continue;
-                }
                 log.info("SmartCaptcha audio: Playwright КЛИК challenge-type selector={}", sel);
                 btn.click(new Locator.ClickOptions()
                         .setTimeout(CHALLENGE_TYPE_CLICK_TIMEOUT_MS)
@@ -845,30 +962,31 @@ public class YandexSmartCaptchaAudioSolver {
                 page.waitForTimeout(400);
                 return true;
             } catch (Exception e) {
-                log.warn("SmartCaptcha audio: Playwright challenge-type {}: {}", sel, e.getMessage());
+                log.debug("SmartCaptcha audio: Playwright challenge-type {}: {}", sel, e.getMessage());
             }
         }
         return false;
     }
 
-    private void clickPlay(Frame frame, Page page) {
+    /** Не блокировать поток на 10–30 с — только короткий force-click. */
+    private void tryClickPlayQuick(Frame frame, Page page) {
         for (String sel : PLAY_SELECTORS) {
             try {
                 Locator play = frame.locator(sel).first();
-                if (play.count() == 0 || !isVisibleQuick(play)) {
+                if (play.count() == 0) {
                     continue;
                 }
                 play.click(new Locator.ClickOptions()
-                        .setTimeout(2_000)
+                        .setTimeout(800)
                         .setNoWaitAfter(true)
                         .setForce(true));
-                log.info("SmartCaptcha audio: play selector={}", sel);
+                log.info("SmartCaptcha audio: play (fallback) selector={}", sel);
                 return;
             } catch (Exception e) {
-                log.debug("SmartCaptcha audio: play {}: {}", sel, e.getMessage());
+                log.debug("SmartCaptcha audio: play quick {}: {}", sel, e.getMessage());
             }
         }
-        log.warn("SmartCaptcha audio: кнопка play не найдена");
+        log.warn("SmartCaptcha audio: play (fallback) — кнопка не нажата");
     }
 
     private boolean submitAnswer(Frame frame, Page page, String answer) {
