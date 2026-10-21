@@ -202,21 +202,39 @@ public class TwoCaptchaClient {
         }
     }
 
+    /** Результат одной серии запросов PazlCaptchaTask к 2Captcha. */
+    public record PazlCaptchaInvokeResult(Optional<PazlSolution> solution, boolean audioFallback) {
+
+        public static PazlCaptchaInvokeResult solved(PazlSolution s) {
+            return new PazlCaptchaInvokeResult(Optional.of(s), false);
+        }
+
+        public static PazlCaptchaInvokeResult forAudioFallback() {
+            return new PazlCaptchaInvokeResult(Optional.empty(), true);
+        }
+
+        public static PazlCaptchaInvokeResult notSolved() {
+            return new PazlCaptchaInvokeResult(Optional.empty(), false);
+        }
+    }
+
     /**
      * Калейдоскоп (слайдер-пазл). По доке 2Captcha solution = число кликов по стрелке ({@code "8"}).
      * Воркеры иногда отдают {@code coordinates:…} (клики по картинке) — это не ответ Pazl, такие
      * решения отбрасываем и создаём новую задачу.
+     * <p>
+     * При первом {@code solution=0} сразу {@link PazlCaptchaInvokeResult#forAudioFallback()} — без повторных Pazl.
      */
-    public Optional<PazlSolution> solvePazlCaptcha(String imageBase64, String taskJson,
-                                                   int sliderMax, int imageWidth) {
+    public PazlCaptchaInvokeResult solvePazlCaptcha(String imageBase64, String taskJson,
+                                                    int sliderMax, int imageWidth) {
         if (!isConfigured()) {
             log.warn("2Captcha: PazlCaptcha пропущен — enabled={}, clientKey={}",
                     enabled, maskClientKey(effectiveApiKey()));
-            return Optional.empty();
+            return PazlCaptchaInvokeResult.notSolved();
         }
         if (imageBase64 == null || imageBase64.isBlank() || taskJson == null || taskJson.isBlank()) {
             log.warn("2Captcha: PazlCaptcha — пустые image/task");
-            return Optional.empty();
+            return PazlCaptchaInvokeResult.notSolved();
         }
         String image = stripDataUrlPrefix(imageBase64);
         int max = sliderMax > 0 ? Math.min(sliderMax, 64) : 28;
@@ -251,15 +269,15 @@ public class TwoCaptchaClient {
                     CaptchaVendorLog.applyVendorAnswer(normalizedApiBase(), "PazlCaptchaTask", taskId,
                             "кликов по стрелке слайдера: " + withId.clicks(),
                             "Playwright YandexKaleidoscopeSolver.applySliderClicks");
-                    return Optional.of(withId);
+                    return PazlCaptchaInvokeResult.solved(withId);
                 }
                 if (s.hasClicks() && s.clicks() != null && s.clicks() == 0) {
-                    log.warn("2Captcha: PazlCaptcha → solution=0 (невалидно для слайдера), reportIncorrect taskId={}",
+                    log.warn("2Captcha: PazlCaptcha → solution=0 — reportIncorrect и переход на audio, taskId={}",
                             taskId);
                     CaptchaVendorLog.vendorResponse(normalizedApiBase(), "PazlCaptchaTask", taskId, rawSol,
-                            "НЕТ (solution=0)", "никто — reportIncorrect + новая задача");
+                            "НЕТ (solution=0)", "YandexSmartCaptchaAudioSolver (AudioTask в сессии браузера)");
                     reportIncorrect(taskId);
-                    continue;
+                    return PazlCaptchaInvokeResult.forAudioFallback();
                 }
                 // coordinates — воркер решил как click-captcha, для слайдера бесполезно
                 log.warn("2Captcha: PazlCaptcha → coordinates вместо кликов (x={} y={}) — reportIncorrect",
@@ -276,14 +294,14 @@ public class TwoCaptchaClient {
             log.error("2Captcha: не удалось решить PazlCaptcha", lastError);
         }
         log.warn("2Captcha: PazlCaptcha — за {} попыток не получили число кликов", attempts);
-        return Optional.empty();
+        return PazlCaptchaInvokeResult.notSolved();
     }
 
-    public Optional<PazlSolution> solvePazlCaptcha(String imageBase64, String taskJson, int sliderMax) {
+    public PazlCaptchaInvokeResult solvePazlCaptcha(String imageBase64, String taskJson, int sliderMax) {
         return solvePazlCaptcha(imageBase64, taskJson, sliderMax, 0);
     }
 
-    public Optional<PazlSolution> solvePazlCaptcha(String imageBase64, String taskJson) {
+    public PazlCaptchaInvokeResult solvePazlCaptcha(String imageBase64, String taskJson) {
         return solvePazlCaptcha(imageBase64, taskJson, 28, 0);
     }
 
@@ -813,7 +831,9 @@ public class TwoCaptchaClient {
                             "текст ответа audio challenge",
                             "YandexSmartCaptchaAudioSolver → поле ввода в iframe");
                 } else {
-                    log.info("2Captcha: {} решена, taskId={}, tokenLen={}", captchaKind, taskId, token.get().length());
+                    log.info(
+                            "2Captcha: {} getTaskResult=ready (токен от воркера, НЕ значит что YouDo принял капчу), taskId={}, tokenLen={}",
+                            captchaKind, taskId, token.get().length());
                     String taskType = captchaKind.contains("proxy") && !captchaKind.contains("proxyless")
                             ? "YandexSmartCaptchaTask"
                             : "YandexSmartCaptchaTaskProxyless";

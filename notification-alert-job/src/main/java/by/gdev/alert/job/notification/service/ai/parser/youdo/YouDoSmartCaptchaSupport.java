@@ -116,11 +116,18 @@ public class YouDoSmartCaptchaSupport {
         }
         int tokenLen = captchaService.smartCaptchaTokenLength(page);
         if (tokenLen > 20) {
-            return captchaService.isCheckboxIframeChallenge(page)
-                    || captchaService.isYandexCheckboxVisible(page)
+            int apiLen = captchaService.smartCaptchaApiTokenLength(page);
+            if (apiLen >= 20) {
+                return captchaService.isCheckboxIframeChallenge(page)
+                        || captchaService.isYandexCheckboxVisible(page);
+            }
+            return captchaService.isSmartCaptchaPending(page)
+                    || captchaService.hasCapturedPuzzleTask(page)
                     || captchaService.isYandexKaleidoscopeChallenge(page)
                     || captchaService.isYandexAdvancedUiVisible(page)
-                    || captchaService.isSmartCaptchaOverlayVisible(page);
+                    || captchaService.isSmartCaptchaOverlayVisible(page)
+                    || captchaService.isCheckboxIframeChallenge(page)
+                    || captchaService.isYandexCheckboxVisible(page);
         }
         if (hasVisibleSmartCaptchaUi(page)) {
             return true;
@@ -234,6 +241,7 @@ public class YouDoSmartCaptchaSupport {
         modalLayoutFix.apply(page);
         captchaService.waitForYandexSmartCaptchaWidget(page, 15_000);
         captchaService.revealYouDoLoginCaptchaIframe(page);
+        captchaService.revealSmartCaptchaOverlay(page);
         page.waitForTimeout(500);
         for (int attempt = 1; attempt <= 3; attempt++) {
             if (!isLoginCaptchaGate(page)) {
@@ -242,10 +250,10 @@ public class YouDoSmartCaptchaSupport {
             log.info("YOUDO SmartCaptcha (попытка {}/3), пользователь: {}, url={}",
                     attempt, login, page.url());
             captchaService.logSmartCaptchaState(page, "youdo-login-attempt-" + attempt + "-before");
-            if (captchaService.smartCaptchaTokenLength(page) > 20
+            if (captchaService.smartCaptchaApiTokenLength(page) > 20
                     && !hasVisibleSmartCaptchaUi(page)
                     && !isActiveYouDoCaptchaChallenge(page)) {
-                log.info("YOUDO SmartCaptcha: smart-token в DOM, видимого challenge нет — пропускаем");
+                log.info("YOUDO SmartCaptcha: виджет принял токен (getResponse), challenge нет — пропускаем");
                 captchaService.logSmartCaptchaResolutionVerdict(page,
                         "youdo-login-attempt-" + attempt + "-skip-token-in-dom user=" + login);
                 trySubmitEmailAfterToken(page, login);
@@ -253,14 +261,17 @@ public class YouDoSmartCaptchaSupport {
             }
             captchaService.waitForYandexSmartCaptchaWidget(page, 12_000);
             captchaService.revealYouDoLoginCaptchaIframe(page);
+            captchaService.revealSmartCaptchaOverlay(page);
             page.waitForTimeout(500);
 
             logDetectedCaptchaUi(page, login, attempt, "перед-solve");
             boolean progressed = solveCurrentChallenge(page, login, attempt);
             log.info("YOUDO SmartCaptcha: solveCurrentChallenge попытка {} → progressed={}, gate={}, stage={}",
                     attempt, progressed, isLoginCaptchaGate(page), isSmartCaptchaStage(page));
-            if (!isLoginCaptchaGate(page)) {
-                captchaService.dismissSmartCaptchaOverlay(page);
+            if (!isLoginCaptchaGate(page) && captchaService.isYandexSmartCaptchaAcceptedByWidget(page)) {
+                captchaService.dismissSmartCaptchaOverlayIfWidgetAccepted(page);
+            } else if (!captchaService.isYandexSmartCaptchaAcceptedByWidget(page)) {
+                captchaService.ensureYouDoCaptchaChallengeVisible(page);
             }
             page.waitForTimeout(800);
             captchaService.logSmartCaptchaState(page, "youdo-login-attempt-" + attempt + "-after");
@@ -274,8 +285,15 @@ public class YouDoSmartCaptchaSupport {
                             attempt, login);
                     continue;
                 }
+                if (!captchaService.isYandexSmartCaptchaReadyForYouDoSubmit(page)) {
+                    log.warn(
+                            "YOUDO SmartCaptcha: stage снят, но виджет не готов (getResponse/challenge), попытка {}, tokenAPI={}",
+                            attempt, captchaService.smartCaptchaApiTokenLength(page));
+                    captchaService.ensureYouDoCaptchaChallengeVisible(page);
+                    continue;
+                }
                 captchaService.resumeYandexSmartCaptchaForForm(page);
-                captchaService.dismissSmartCaptchaOverlay(page);
+                captchaService.dismissSmartCaptchaOverlayIfWidgetAccepted(page);
                 log.info("YOUDO SmartCaptcha снята после попытки {}, пользователь: {}", attempt, login);
                 captchaService.logSmartCaptchaResolutionVerdict(page,
                         "youdo-login-attempt-" + attempt + "-stage-clear user=" + login);
@@ -439,7 +457,9 @@ public class YouDoSmartCaptchaSupport {
         if (page == null || page.isClosed()) {
             return;
         }
-        if (captchaService.smartCaptchaTokenLength(page) < 20) {
+        if (!captchaService.isYandexSmartCaptchaReadyForYouDoSubmit(page)) {
+            log.info("YOUDO post-token: пропуск submit — getResponse/challenge не готовы, tokenAPI={}",
+                    captchaService.smartCaptchaApiTokenLength(page));
             return;
         }
         try {
@@ -465,7 +485,8 @@ public class YouDoSmartCaptchaSupport {
             log.info("YOUDO SmartCaptcha → checkbox [{}]: 2Captcha для checkbox", reason);
             if (captchaService.solveYandexForYouDoViaTwoCaptcha(page)) {
                 page.waitForTimeout(1200);
-                if (!isSmartCaptchaStage(page) || captchaService.smartCaptchaTokenLength(page) > 20) {
+                if (!isSmartCaptchaStage(page)
+                        && captchaService.isYandexSmartCaptchaReadyForYouDoSubmit(page)) {
                     log.info("YOUDO SmartCaptcha → checkbox [{}]: 2Captcha ok, resumeYandexSmartCaptchaForForm",
                             reason);
                     captchaService.resumeYandexSmartCaptchaForForm(page);
@@ -477,8 +498,8 @@ public class YouDoSmartCaptchaSupport {
         log.info("YOUDO SmartCaptcha → checkbox [{}]: клик в checkbox-iframe", reason);
         if (captchaService.clickCheckboxInSmartCaptchaIframe(page)) {
             page.waitForTimeout(1200);
-            if (captchaService.smartCaptchaTokenLength(page) > 20) {
-                log.info("YOUDO SmartCaptcha → checkbox [{}]: клик ok, tokenLen>20, resume формы", reason);
+            if (captchaService.isYandexSmartCaptchaReadyForYouDoSubmit(page)) {
+                log.info("YOUDO SmartCaptcha → checkbox [{}]: клик ok, getResponse OK, resume формы", reason);
                 captchaService.resumeYandexSmartCaptchaForForm(page);
                 return true;
             }

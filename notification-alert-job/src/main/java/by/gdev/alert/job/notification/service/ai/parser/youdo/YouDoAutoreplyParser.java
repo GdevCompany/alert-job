@@ -538,13 +538,18 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             return null;
         }
         if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
-            log.info("АВТООТВЕТ: {} -> postCaptcha: loginCaptchaGate — ждём повторного прохода капчи, пользователь: {}",
-                    getSiteName(), creds.login());
-            return null;
+            if (captchaService.isYandexSmartCaptchaReadyForYouDoSubmit(page)) {
+                log.info("АВТООТВЕТ: {} -> postCaptcha: loginCaptchaGate игнор (getResponse OK), пользователь: {}",
+                        getSiteName(), creds.login());
+            } else {
+                log.info("АВТООТВЕТ: {} -> postCaptcha: loginCaptchaGate — ждём повторного прохода капчи, "
+                        + "пользователь: {}", getSiteName(), creds.login());
+                return null;
+            }
         }
         if (isYouDoEmailSubmitLoading(page)) {
-            log.info("АВТООТВЕТ: {} -> капча снята, ждём завершение запроса email, пользователь: {}",
-                    getSiteName(), creds.login());
+            log.info("АВТООТВЕТ: {} -> «Далее» в loading (tokenAPI={}), ждём signin/OTP, пользователь: {}",
+                    getSiteName(), captchaService.smartCaptchaApiTokenLength(page), creds.login());
             postCaptchaSubmit.logNextButtonMarkup(page, "submit-loading-start");
             postCaptchaSubmit.watchNextButtonWhileLoading(page, "submit", YOUDO_POST_SUBMIT_WAIT_MS);
             waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
@@ -556,16 +561,23 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                 log.info("АВТООТВЕТ: {} -> спиннер после smart-token, возобновляем отправку email, пользователь: {}",
                         getSiteName(), creds.login());
                 captchaService.resumeYandexSmartCaptchaForForm(page);
-                captchaService.dismissSmartCaptchaOverlay(page);
+                captchaService.dismissSmartCaptchaOverlayIfWidgetAccepted(page);
+                postCaptchaSubmit.resetStuckEmailSubmitUi(page);
                 page.waitForTimeout(600);
                 tryResumeYouDoEmailSubmitAfterCaptcha(page, creds.login());
-                waitForYouDoLoginProgress(page, 28_000);
+                waitForYouDoLoginProgress(page, 12_000);
+            }
+            if (isYouDoEmailSubmitLoading(page) && hasYouDoSmartTokenForSubmit(page)) {
+                log.info("АВТООТВЕТ: {} -> спиннер не снялся, recover «Назад» + «Далее», пользователь: {}",
+                        getSiteName(), creds.login());
+                postCaptchaSubmit.recoverStuckSubmitViaBack(page, creds.login());
+                waitForYouDoLoginProgress(page, 15_000);
             }
             if (isYouDoEmailSubmitLoading(page) && hasYouDoSmartTokenForSubmit(page)) {
                 log.info("АВТООТВЕТ: {} -> спиннер не снялся, force «Далее» после капчи, пользователь: {}",
                         getSiteName(), creds.login());
-                forceClickYouDoNextAfterCaptcha(page);
-                waitForYouDoLoginProgress(page, 20_000);
+                forceClickYouDoNextAfterCaptcha(page, creds.login());
+                waitForYouDoLoginProgress(page, 15_000);
             }
             if (isYouDoEmailSubmitLoading(page) && !isOtpFieldVisible(page)) {
                 return failYouDoEmailSubmitStuck(page, creds.login());
@@ -589,7 +601,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             waitAfterYouDoNextClick(page);
             waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
         } else {
-            forceClickYouDoNextAfterCaptcha(page);
+            forceClickYouDoNextAfterCaptcha(page, creds.login());
             waitForYouDoLoginProgress(page, YOUDO_POST_SUBMIT_WAIT_MS);
         }
         if (!isOtpFieldVisible(page) && isEmailFieldVisible(page) && hasYouDoSmartTokenForSubmit(page)) {
@@ -605,7 +617,8 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
             return;
         }
         captchaService.resumeYandexSmartCaptchaForForm(page);
-        captchaService.dismissSmartCaptchaOverlay(page);
+        captchaService.dismissSmartCaptchaOverlayIfWidgetAccepted(page);
+        postCaptchaSubmit.resetStuckEmailSubmitUi(page);
         postCaptchaSubmit.ensureLoginEmail(page, loginEmail);
         if (!isYouDoEmailSubmitLoading(page) && isYouDoNextButtonClickable(page)) {
             clickYouDoNextButton(page);
@@ -653,30 +666,18 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     }
 
     /** Повтор «Далее» при зависшем спиннере после smart-token (обычный клик блокируется isYouDoEmailSubmitLoading). */
-    private void forceClickYouDoNextAfterCaptcha(Page page) {
+    private void forceClickYouDoNextAfterCaptcha(Page page, String loginEmail) {
         if (page == null || page.isClosed()) {
             return;
         }
+        captchaService.clearCapturedPuzzleTasks(page);
         try {
-            page.evaluate(
-                    """
-                            () => {
-                              for (const b of document.querySelectorAll('button')) {
-                                if (b.offsetParent === null) continue;
-                                const text = (b.textContent || '').trim();
-                                if (!text.includes('Далее')) continue;
-                                b.disabled = false;
-                                b.removeAttribute('aria-busy');
-                                b.classList.remove('disabled');
-                                const spin = b.querySelector('[class*="Loader"], [class*="loader"], [class*="Spinner"], [class*="spinner"], svg');
-                                if (spin) spin.remove();
-                              }
-                            }
-                            """);
-        } catch (Exception e) {
-            log.debug("АВТООТВЕТ: {} -> сброс спиннера force «Далее»: {}", getSiteName(), e.getMessage());
-        }
-        try {
+            if (postCaptchaSubmit.submitEmailAfterSmartToken(page, loginEmail)) {
+                log.info("АВТООТВЕТ: {} -> force submit email после капчи", getSiteName());
+                waitAfterYouDoNextClick(page);
+                return;
+            }
+            postCaptchaSubmit.resetStuckEmailSubmitUi(page);
             if (postCaptchaSubmit.clickLoginModalNext(page, true)) {
                 log.info("АВТООТВЕТ: {} -> force-клик «Далее» после капчи", getSiteName());
                 waitAfterYouDoNextClick(page);
@@ -694,6 +695,11 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         if (smartCaptchaSupport.isLoginCaptchaGate(page)) {
             captchaService.waitForYandexSmartCaptchaWidget(page, 15_000);
             captchaService.revealYouDoLoginCaptchaIframe(page);
+            captchaService.revealSmartCaptchaOverlay(page);
+            page.waitForTimeout(400);
+        } else if (isYouDoEmailSubmitLoading(page)) {
+            captchaService.waitForYandexSmartCaptchaWidget(page, 8_000);
+            captchaService.revealSmartCaptchaOverlay(page);
             page.waitForTimeout(400);
         } else if (hasYouDoSmartTokenForSubmit(page)) {
             page.waitForTimeout(600);
@@ -704,7 +710,7 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
     }
 
     private boolean hasYouDoSmartTokenForSubmit(Page page) {
-        return captchaService != null && captchaService.smartCaptchaTokenLength(page) > 20;
+        return captchaService != null && captchaService.isYandexSmartCaptchaAcceptedByWidget(page);
     }
 
     private boolean clickYouDoNextButton(Page page) {
@@ -753,8 +759,13 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
                                 if (text.includes('Назад')) continue;
                                 const r = b.getBoundingClientRect();
                                 if (r.width < 50 || r.height < 24) continue;
-                                const busy = b.disabled || b.getAttribute('aria-busy') === 'true'
-                                  || b.querySelector('svg, [class*="Loader"], [class*="loader"], [class*="Spinner"], [class*="spinner"]');
+                                if (!text.includes('Далее') && text) continue;
+                                const loader = b.querySelector(
+                                  'svg, [class*="Loader"], [class*="loader"], [class*="Spinner"], [class*="spinner"]');
+                                const cls = String(b.className || '');
+                                const loadingClass = cls.includes('isLoading') || cls.includes('IsLoading');
+                                const busy = b.disabled || b.getAttribute('aria-busy') === 'true' || loader
+                                  || loadingClass;
                                 if (busy && (text.includes('Далее') || !text)) return true;
                               }
                               return false;
@@ -811,11 +822,15 @@ public class YouDoAutoreplyParser extends AutoreplyParser implements AutoreplyPl
         YouDoLoginFsmState.log(log, YouDoLoginFsmState.CAPTCHA_GUARD, creds.login(), "resolve kind=" + kind);
         modalLayoutFix.apply(page);
         captchaService.revealYouDoLoginCaptchaIframe(page);
+        captchaService.revealSmartCaptchaOverlay(page);
         if (!smartCaptchaSupport.passLoginSmartCaptcha(page, creds.login())) {
             return failYouDoCaptcha(page, creds.login(), "YouDo SmartCaptcha не пройдена (2Captcha)");
         }
         captchaService.resumeYandexSmartCaptchaForForm(page);
-        captchaService.dismissSmartCaptchaOverlay(page);
+        captchaService.dismissSmartCaptchaOverlayIfWidgetAccepted(page);
+        if (!captchaService.isYandexSmartCaptchaAcceptedByWidget(page)) {
+            captchaService.ensureYouDoCaptchaChallengeVisible(page);
+        }
         return null;
     }
 

@@ -38,6 +38,10 @@ public class PlaywrightManager implements PlaywrightBrowserManager {
     @Value("${playwright.chromium.slow-mo-ms:120}")
     private int slowMoMs;
 
+    /** &gt;0 — Chromium слушает CDP (config: playwright.chromium.remote-debugging-port). */
+    @Value("${playwright.chromium.remote-debugging-port:0}")
+    private int cdpDebugPort;
+
     @Override
     public Playwright createPlaywright() {
         try {
@@ -86,6 +90,10 @@ public class PlaywrightManager implements PlaywrightBrowserManager {
         ));
         if (headless && headlessNew) {
             args.add("--headless=new");
+        }
+        if (cdpDebugPort > 0) {
+            args.add("--remote-debugging-port=" + cdpDebugPort);
+            log.info("Playwright CDP: порт {} (подключение: http://127.0.0.1:{})", cdpDebugPort, cdpDebugPort);
         }
 
         BrowserType.LaunchOptions launchOptions = new BrowserType.LaunchOptions()

@@ -48,6 +48,8 @@ public class YandexKaleidoscopeSolver {
     private static final double MIN_KALEIDOSCOPE_CANVAS_H = 40;
     private static final int MIN_PAZL_IMAGE_BASE64_LEN = 4_000;
 
+    private volatile boolean lastPazlAbortedForAudio;
+
     private static final String[] SLIDER_ARROW_SELECTORS = {
             ".CaptchaSlider-Button_direction_right",
             ".AdvancedCaptcha-SliderControl-Button_direction_right",
@@ -73,7 +75,7 @@ public class YandexKaleidoscopeSolver {
         networkCaptures.computeIfAbsent(ctx, c -> {
             NetworkCaptureSession session = new NetworkCaptureSession();
             session.tasks = new CopyOnWriteArrayList<>();
-            session.listener = captureTaskFromResponse(session.tasks);
+            session.listener = captureTaskFromResponse(session);
             ctx.onResponse(session.listener);
             log.debug("Kaleidoscope: перехват network запущен (context)");
             return session;
@@ -96,7 +98,18 @@ public class YandexKaleidoscopeSolver {
         }
     }
 
-    /** Есть валидный puzzle task из перехвата network (например ответ {@code /check} до появления canvas). */
+    /** URL поля {@code voice} из ответа {@code /check} (load-captcha-voice или прямой voice?key). */
+    public Optional<String> getLastVoiceUrl(Page page) {
+        if (page == null) {
+            return Optional.empty();
+        }
+        NetworkCaptureSession session = networkCaptures.get(page.context());
+        if (session == null || session.lastVoiceUrl == null || session.lastVoiceUrl.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.of(session.lastVoiceUrl);
+    }
+
     public boolean hasCapturedPuzzleTask(Page page) {
         if (page == null) {
             return false;
@@ -106,6 +119,21 @@ public class YandexKaleidoscopeSolver {
             return false;
         }
         return pickValidatedNetworkTask(session.tasks).isPresent();
+    }
+
+    /** Сброс task из /check после внешнего smart-token — иначе YouDo снова уходит в Pazl без canvas. */
+    public void clearCapturedPuzzleTasks(Page page) {
+        if (page == null) {
+            return;
+        }
+        NetworkCaptureSession session = networkCaptures.get(page.context());
+        if (session != null && session.tasks != null) {
+            int n = session.tasks.size();
+            session.tasks.clear();
+            if (n > 0) {
+                log.debug("Kaleidoscope: очищено network task-событий: {}", n);
+            }
+        }
     }
 
     public boolean isVisible(Page page) {
@@ -139,10 +167,28 @@ public class YandexKaleidoscopeSolver {
         return false;
     }
 
+    /** Последний {@link #solve}: 2Captcha вернула Pazl {@code solution=0}, дальше нужен audio. */
+    public boolean lastPazlAbortedForAudio() {
+        return lastPazlAbortedForAudio;
+    }
+
+    /** URL аудио из ответа {@code /check} (то же, что открываешь в браузере). */
+    public Optional<String> getLastCapturedVoiceUrl(Page page) {
+        if (page == null) {
+            return Optional.empty();
+        }
+        NetworkCaptureSession session = networkCaptures.get(page.context());
+        if (session == null || session.lastVoiceUrl == null || session.lastVoiceUrl.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.of(session.lastVoiceUrl);
+    }
+
     /**
      * Решает калейдоскоп, если виден. Возвращает true, если challenge нет или успешно пройден.
      */
     public boolean solve(Page page) {
+        lastPazlAbortedForAudio = false;
         boolean puzzleVisible = isVisible(page);
         boolean hasNetworkTask = hasCapturedPuzzleTask(page);
         if (!puzzleVisible && !hasNetworkTask) {
@@ -159,8 +205,10 @@ public class YandexKaleidoscopeSolver {
         if (existing != null) {
             networkTasks = existing.tasks;
         } else {
-            networkTasks = new CopyOnWriteArrayList<>();
-            extraListener = captureTaskFromResponse(networkTasks);
+            NetworkCaptureSession temp = new NetworkCaptureSession();
+            temp.tasks = new CopyOnWriteArrayList<>();
+            networkTasks = temp.tasks;
+            extraListener = captureTaskFromResponse(temp);
             page.context().onResponse(extraListener);
         }
         try {
@@ -206,8 +254,14 @@ public class YandexKaleidoscopeSolver {
 
                 int sliderMax = readSliderMax(captchaFrame);
                 log.info("Kaleidoscope: → 2Captcha solvePazlCaptcha sliderMax={}", sliderMax);
-                Optional<TwoCaptchaClient.PazlSolution> solution = twoCaptchaClient.solvePazlCaptcha(
+                TwoCaptchaClient.PazlCaptchaInvokeResult pazlResult = twoCaptchaClient.solvePazlCaptcha(
                         imageBase64.get(), taskJson.get(), sliderMax, PAZL_WIDTH);
+                if (pazlResult.audioFallback()) {
+                    lastPazlAbortedForAudio = true;
+                    log.warn("Kaleidoscope: Pazl solution=0 — прекращаем Pazl, переключаемся на audio");
+                    break;
+                }
+                Optional<TwoCaptchaClient.PazlSolution> solution = pazlResult.solution();
                 if (solution.isEmpty() || !solution.get().hasClicks() || solution.get().clicks() <= 0) {
                     log.warn("Kaleidoscope: 2Captcha не вернула положительное число кликов (sliderMax={})",
                             sliderMax);
@@ -241,9 +295,16 @@ public class YandexKaleidoscopeSolver {
                     twoCaptchaClient.reportIncorrect(taskId);
                 }
             }
+            if (lastPazlAbortedForAudio) {
+                return false;
+            }
             boolean gone = !isVisible(page);
             if (!gone) {
                 log.warn("Kaleidoscope: не пройден за 3 раунда");
+            }
+            if (!gone && hasCapturedPuzzleTask(page) && findKaleidoscopeFrame(page).isEmpty()) {
+                log.warn("Kaleidoscope: есть network task, но canvas/iframe пазла нет — считаем неуспехом");
+                return false;
             }
             return gone;
         } finally {
@@ -264,6 +325,7 @@ public class YandexKaleidoscopeSolver {
     private static final class NetworkCaptureSession {
         CopyOnWriteArrayList<String> tasks;
         Consumer<Response> listener;
+        volatile String lastVoiceUrl;
     }
 
     private boolean hasKaleidoscopeInFrame(Frame frame) {
@@ -319,7 +381,7 @@ public class YandexKaleidoscopeSolver {
         return Optional.empty();
     }
 
-    private Consumer<Response> captureTaskFromResponse(List<String> sink) {
+    private Consumer<Response> captureTaskFromResponse(NetworkCaptureSession session) {
         return response -> {
             try {
                 String url = response.url();
@@ -333,8 +395,12 @@ public class YandexKaleidoscopeSolver {
                 if (body == null || body.isBlank()) {
                     return;
                 }
+                extractVoiceUrlFromCheckBody(body).ifPresent(voice -> {
+                    session.lastVoiceUrl = voice;
+                    log.info("Kaleidoscope: voice из /check {}", truncate(voice, 120));
+                });
                 findTaskArrayInJson(body).ifPresentOrElse(task -> {
-                    sink.add(task);
+                    session.tasks.add(task);
                     log.info("Kaleidoscope: task из network {} len={}", truncate(url, 80),
                             TwoCaptchaClient.summarizeTaskArray(task));
                 }, () -> {
@@ -427,6 +493,24 @@ public class YandexKaleidoscopeSolver {
             }
         } catch (Exception e) {
             log.warn("Kaleidoscope: DOM extract task: {}", e.getMessage());
+        }
+        return Optional.empty();
+    }
+
+    private Optional<String> extractVoiceUrlFromCheckBody(String body) {
+        if (body == null || body.isBlank() || !body.contains("voice")) {
+            return Optional.empty();
+        }
+        try {
+            JsonNode root = objectMapper.readTree(body);
+            JsonNode voice = root.path("captcha").path("voice");
+            if (voice.isTextual()) {
+                String v = voice.asText().trim();
+                if (!v.isEmpty()) {
+                    return Optional.of(v);
+                }
+            }
+        } catch (Exception ignored) {
         }
         return Optional.empty();
     }

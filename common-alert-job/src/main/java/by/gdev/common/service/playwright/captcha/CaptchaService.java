@@ -32,6 +32,146 @@ public class CaptchaService {
     private static final Pattern SITEKEY_QUERY = Pattern.compile("[?&]sitekey=([^&]+)", Pattern.CASE_INSENSITIVE);
 
     /**
+     * YouDo/React: после внешнего токена (2Captcha) нужно вызвать {@code callback} из {@code smartCaptcha.render}
+     * и подписчиков {@code subscribe(..., 'success')} — иначе {@code getResponse()=0} и спиннер «Далее» не снимается.
+     */
+    private static final String DISPATCH_YANDEX_WIDGET_SUCCESS_JS = """
+            (token) => {
+              if (!token || token.length < 20) return JSON.stringify({ hits: 0, reason: 'no-token' });
+              let hits = 0;
+              const setHidden = (root) => {
+                const sel = ['input[name="smart-token"]', 'input[name="smart_token"]'];
+                const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                const setter = desc && desc.set;
+                for (const s of sel) {
+                  const el = (root || document).querySelector(s);
+                  if (el) {
+                    if (setter) setter.call(el, token); else el.value = token;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                  }
+                }
+                return false;
+              };
+              setHidden(document);
+              document.querySelectorAll('[data-sentry-component="SmartCaptcha"], .smart-captcha, [data-sitekey]')
+                .forEach((c) => setHidden(c));
+              const walkFiber = (dom, visitor) => {
+                if (!dom) return;
+                const key = Object.keys(dom).find((k) => k.startsWith('__reactFiber$'));
+                if (!key) return;
+                let fiber = dom[key];
+                for (let i = 0; i < 160 && fiber; i++) {
+                  visitor(fiber);
+                  fiber = fiber.return;
+                }
+              };
+              const tryCall = (fn, t) => {
+                if (typeof fn !== 'function') return false;
+                try { fn(t); return true; } catch (e1) {
+                  try { fn(); return true; } catch (e2) { return false; }
+                }
+              };
+              const invokeProps = (props, t) => {
+                if (!props || typeof props !== 'object') return 0;
+                let n = 0;
+                for (const [name, fn] of Object.entries(props)) {
+                  if (typeof fn !== 'function') continue;
+                  if (/callback|onSuccess|onCaptcha|onVerify|onToken|success|smartCaptcha/i.test(name)) {
+                    if (tryCall(fn, t)) n++;
+                  }
+                }
+                return n;
+              };
+              const roots = document.querySelectorAll(
+                '[role="dialog"], [data-sentry-component="SmartCaptcha"], input[name="login"], [data-sitekey]');
+              roots.forEach((dom) => {
+                walkFiber(dom, (fiber) => {
+                  const tn = fiber.type && (fiber.type.displayName || fiber.type.name
+                    || (fiber.elementType && (fiber.elementType.displayName || fiber.elementType.name))) || '';
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (!props) return;
+                  if (/SignIn|SmartCaptcha|Captcha|Email|Login/i.test(String(tn))) {
+                    hits += invokeProps(props, token);
+                  }
+                  hits += invokeProps(props, token);
+                });
+                const propKey = Object.keys(dom).find((k) => k.startsWith('__reactProps$'));
+                if (propKey && dom[propKey]) hits += invokeProps(dom[propKey], token);
+              });
+              document.querySelectorAll('.smart-captcha, [data-sitekey]').forEach((container) => {
+                const cb = container.getAttribute('data-callback');
+                if (cb && typeof window[cb] === 'function') {
+                  try { window[cb](token); hits++; } catch (e) { /* ignore */ }
+                }
+              });
+              if (window.smartCaptcha) {
+                const collectIds = () => {
+                  const ids = [];
+                  const push = (v) => { if (v !== undefined && v !== null && v !== '') ids.push(v); };
+                  try {
+                    const maps = [
+                      window.smartCaptcha._widgetIdMap,
+                      window.smartCaptcha._widgetIds,
+                      window.smartCaptcha._widgets,
+                      window.smartCaptcha._clients
+                    ];
+                    for (const m of maps) {
+                      if (!m) continue;
+                      if (typeof m === 'object') {
+                        for (const v of Object.values(m)) push(v);
+                      }
+                    }
+                  } catch (e) { /* ignore */ }
+                  document.querySelectorAll('[data-smart-captcha-widget-id]').forEach((el) => {
+                    push(el.getAttribute('data-smart-captcha-widget-id'));
+                  });
+                  return [...new Set(ids)];
+                };
+                for (const id of collectIds()) {
+                  try {
+                    if (typeof window.smartCaptcha.setResponse === 'function') {
+                      window.smartCaptcha.setResponse(id, token);
+                      hits++;
+                    }
+                  } catch (e) { /* ignore */ }
+                }
+                try {
+                  if (typeof window.smartCaptcha.setResponse === 'function') {
+                    window.smartCaptcha.setResponse(token);
+                    hits++;
+                  }
+                } catch (e) { /* ignore */ }
+              }
+              const payloads = [
+                { event: 'smart-captcha', token },
+                { methodCall: 'success', token },
+                { type: 'smart-captcha', token },
+                { status: 'success', token },
+                { eventType: 'captcha-success', token }
+              ];
+              for (const p of payloads) {
+                window.postMessage(JSON.stringify(p), '*');
+                window.dispatchEvent(new CustomEvent('smart-captcha-token', { detail: token }));
+              }
+              document.querySelectorAll('iframe[src*="smartcaptcha"]').forEach((iframe) => {
+                for (const p of payloads) {
+                  try { iframe.contentWindow.postMessage(JSON.stringify(p), '*'); } catch (e) { /* cross-origin */ }
+                }
+              });
+              let apiLen = 0;
+              try {
+                if (window.smartCaptcha && typeof window.smartCaptcha.getResponse === 'function') {
+                  const r = window.smartCaptcha.getResponse();
+                  apiLen = r && r.length > 20 ? r.length : 0;
+                }
+              } catch (e) { /* ignore */ }
+              return JSON.stringify({ hits, tokenApiLen: apiLen });
+            }
+            """;
+
+    /**
      * Advanced SmartCaptcha UI: слайдер-пазл (kaleidoscope), модалка YouDo/ServicePipe и т.п.
      * Часто в DOM без обёртки {@code SmartCaptcha-Overlay_visible}.
      */
@@ -607,6 +747,36 @@ public class CaptchaService {
         }
     }
 
+    /** Показать full-screen advanced/kaleidoscope после того как {@link #dismissSmartCaptchaOverlay} спрятал оверлей. */
+    public void revealSmartCaptchaOverlay(Page page) {
+        try {
+            page.evaluate(
+                    """
+                            () => {
+                              const selectors = [
+                                '[data-testid="advanced-container"]',
+                                '.SmartCaptcha-Overlay',
+                                'iframe[data-testid="advanced-iframe"]',
+                                'iframe[src*="smartcaptcha.cloud.yandex.ru/advanced"]'
+                              ];
+                              for (const sel of selectors) {
+                                document.querySelectorAll(sel).forEach((el) => {
+                                  el.style.removeProperty('display');
+                                  el.style.removeProperty('visibility');
+                                  el.style.removeProperty('pointer-events');
+                                  el.style.removeProperty('opacity');
+                                  el.style.removeProperty('z-index');
+                                  el.classList.add('SmartCaptcha-Overlay_visible');
+                                });
+                              }
+                            }
+                            """);
+            log.info("SmartCaptcha: оверлей advanced показан (если был в DOM)");
+        } catch (Exception e) {
+            log.debug("SmartCaptcha: не удалось показать оверлей: {}", e.getMessage());
+        }
+    }
+
     /**
      * YouDo: после 2Captcha full-screen {@code advanced-iframe} часто остаётся в DOM и перехватывает клик по «Далее».
      */
@@ -920,6 +1090,157 @@ public class CaptchaService {
         return false;
     }
 
+    /** Длина токена в {@code window.smartCaptcha.getResponse()} (виджет принял капчу в сессии браузера). */
+    public int smartCaptchaApiTokenLength(Page page) {
+        return readYandexSmartCaptchaApiResponseLength(page);
+    }
+
+    /**
+     * Капча пройдена по контракту Yandex/2Captcha: токен в {@code smartCaptcha.getResponse()},
+     * а не только в hidden {@code smart-token} (см. 2captcha.com/api-docs/yandex-smart-captcha).
+     */
+    public boolean isYandexSmartCaptchaAcceptedByWidget(Page page) {
+        return smartCaptchaApiTokenLength(page) > 20;
+    }
+
+    /** YouDo: виджет принял токен и нет видимого advanced/kaleidoscope. */
+    public boolean isYandexSmartCaptchaReadyForYouDoSubmit(Page page) {
+        if (!isYandexSmartCaptchaAcceptedByWidget(page)) {
+            return false;
+        }
+        try {
+            return !isYandexKaleidoscopeChallenge(page)
+                    && !isYandexAdvancedUiVisible(page)
+                    && !isSmartCaptchaOverlayVisible(page);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static boolean isYouDoPage(Page page) {
+        if (page == null || page.isClosed()) {
+            return false;
+        }
+        try {
+            String url = page.url();
+            return url != null && url.contains("youdo");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * YouDo: не прячем калейдоскоп/оверлей, пока {@code getResponse()} пустой — иначе кажется, что капча «снята».
+     */
+    public void dismissSmartCaptchaOverlayIfWidgetAccepted(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        if (isYandexSmartCaptchaAcceptedByWidget(page)) {
+            dismissSmartCaptchaOverlay(page);
+            if (isYouDoPage(page)) {
+                suppressYouDoLoginCaptchaClickBlockers(page);
+                clearCapturedPuzzleTasks(page);
+            }
+            return;
+        }
+        if (isYouDoPage(page)) {
+            ensureYouDoCaptchaChallengeVisible(page);
+        }
+    }
+
+    /** Вернуть challenge на экран, если внешний токен в DOM, но виджет ещё не принял. */
+    public void ensureYouDoCaptchaChallengeVisible(Page page) {
+        if (page == null || page.isClosed() || !isYouDoPage(page)) {
+            return;
+        }
+        if (isYandexSmartCaptchaAcceptedByWidget(page)) {
+            return;
+        }
+        revealYouDoLoginCaptchaIframe(page);
+        revealOffScreenSmartCaptchaHosts(page);
+        revealSmartCaptchaOverlay(page);
+        log.info("SmartCaptcha/YouDo: challenge оставлен/показан — getResponse() ещё пустой (tokenВПоле={})",
+                smartCaptchaTokenLength(page));
+    }
+
+    private static final String SMART_CAPTCHA_API_RESPONSE_LEN_JS = """
+            () => {
+              if (!window.smartCaptcha || typeof window.smartCaptcha.getResponse !== 'function') {
+                return 0;
+              }
+              const len = (r) => (r && r.length > 20 ? r.length : 0);
+              try {
+                const r = window.smartCaptcha.getResponse();
+                const n = len(r);
+                if (n > 0) return n;
+              } catch (e) { /* try per-widget id */ }
+              const idMaps = [
+                window.smartCaptcha._widgetIdMap,
+                window.smartCaptcha._widgetIds,
+                window.smartCaptcha._widgets
+              ];
+              for (const ids of idMaps) {
+                if (!ids || typeof ids !== 'object') continue;
+                for (const id of Object.values(ids)) {
+                  try {
+                    const r = window.smartCaptcha.getResponse(id);
+                    const n = len(r);
+                    if (n > 0) return n;
+                  } catch (err) { /* next id */ }
+                }
+              }
+              return 0;
+            }
+            """;
+
+    /**
+     * YouDo: калейдоскоп с task из {@code /check} — Pazl в той же сессии, что и виджет (не {@code YandexSmartCaptchaTask}).
+     */
+    public boolean solveYouDoBrowserSessionKaleidoscope(Page page) {
+        if (page == null || page.isClosed() || !twoCaptchaClient.isConfigured()) {
+            return false;
+        }
+        if (smartCaptchaTokenLength(page) > 20
+                && !isYandexKaleidoscopeChallenge(page)
+                && !isYandexAdvancedUiVisible(page)) {
+            log.info("SmartCaptcha/YouDo: smart-token уже в DOM, видимого пазла нет — Pazl в сессии не нужен");
+            clearCapturedPuzzleTasks(page);
+            return false;
+        }
+        if (!kaleidoscopeSolver.hasCapturedPuzzleTask(page)
+                && !isYandexKaleidoscopeChallenge(page)
+                && !isYandexAdvancedUiVisible(page)) {
+            return false;
+        }
+        revealYouDoLoginCaptchaIframe(page);
+        revealOffScreenSmartCaptchaHosts(page);
+        revealSmartCaptchaOverlay(page);
+        log.info("SmartCaptcha/YouDo: PazlCaptchaTask по network task (сессия браузера)");
+        boolean ok = kaleidoscopeSolver.solve(page);
+        if (!ok && yandexAudioEnabled) {
+            if (kaleidoscopeSolver.lastPazlAbortedForAudio()) {
+                log.info("SmartCaptcha/YouDo: Pazl solution=0 — переключаемся на AudioTask (сессия браузера)");
+            } else {
+                log.info("SmartCaptcha/YouDo: Pazl не прошёл — пробуем AudioTask");
+            }
+            java.util.ArrayList<String> voiceSeeds = new java.util.ArrayList<>();
+            kaleidoscopeSolver.getLastVoiceUrl(page).ifPresent(voiceSeeds::add);
+            ok = yandexAudioSolver.solve(page, voiceSeeds);
+            log.info("SmartCaptcha/YouDo: AudioTask после Pazl → {}", ok ? "ok" : "не снято");
+        }
+        if (ok && isYandexSmartCaptchaAcceptedByWidget(page)) {
+            dismissSmartCaptchaOverlay(page);
+            resumeYandexSmartCaptchaForForm(page);
+            page.waitForTimeout(800);
+        } else if (ok) {
+            ensureYouDoCaptchaChallengeVisible(page);
+        }
+        boolean widgetOk = isYandexSmartCaptchaAcceptedByWidget(page);
+        logSmartCaptchaResolutionVerdict(page, widgetOk ? "youdo-browser-pazl-ok" : "youdo-browser-pazl-fail");
+        return widgetOk;
+    }
+
     public int smartCaptchaTokenLength(Page page) {
         if (page == null) {
             return 0;
@@ -987,6 +1308,10 @@ public class CaptchaService {
             return false;
         }
         return kaleidoscopeSolver.hasCapturedPuzzleTask(page);
+    }
+
+    public void clearCapturedPuzzleTasks(Page page) {
+        kaleidoscopeSolver.clearCapturedPuzzleTasks(page);
     }
 
     /** Снять off-screen позиционирование iframe SmartCaptcha (часто bbox @ -10000). */
@@ -1172,20 +1497,40 @@ public class CaptchaService {
         }
         Frame frame = findYandexCaptchaFrame(page);
         Frame tokenFrame = frame != null ? frame : page.mainFrame();
-        applyYandexSmartCaptchaToken(page, tokenFrame, token.get());
-        dismissSmartCaptchaOverlay(page);
-        page.waitForTimeout(1500);
-        if (!isSmartCaptchaPending(page)) {
+        String tokenStr = token.get();
+        applyYandexSmartCaptchaToken(page, tokenFrame, tokenStr);
+        waitForYandexSmartCaptchaWidgetAcceptance(page, tokenStr, 6_000);
+        if (isYandexSmartCaptchaAcceptedByWidget(page)) {
+            dismissSmartCaptchaOverlayIfWidgetAccepted(page);
             logSmartCaptchaResolutionVerdict(page, "after-2captcha-token-viaToken");
             return true;
         }
-        if (smartCaptchaTokenLength(page) > 20) {
-            logSmartCaptchaResolutionVerdict(page, "after-2captcha-token-viaToken-field");
+        boolean checkboxUi = frame != null && isYandexSmartCaptchaPassed(frame);
+        if (checkboxUi && !isYandexKaleidoscopeChallenge(page) && !isYandexAdvancedUiVisible(page)) {
+            dismissSmartCaptchaOverlayIfWidgetAccepted(page);
+            logSmartCaptchaResolutionVerdict(page, "after-2captcha-token-viaToken-checkbox-ui");
             return true;
         }
-        boolean passed = frame != null && isYandexSmartCaptchaPassed(frame);
-        logSmartCaptchaResolutionVerdict(page, passed ? "after-2captcha-token-viaToken-ui" : "after-2captcha-token-viaToken-fail");
-        return passed;
+        if (isYouDoPage(page)) {
+            ensureYouDoCaptchaChallengeVisible(page);
+        }
+        logSmartCaptchaResolutionVerdict(page, "after-2captcha-token-viaToken-fail");
+        return false;
+    }
+
+    /** После внешнего токена: ждём {@code getResponse()} и повторяем dispatch колбэков виджета. */
+    private void waitForYandexSmartCaptchaWidgetAcceptance(Page page, String token, long timeoutMs) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline && !page.isClosed()) {
+            if (isYandexSmartCaptchaAcceptedByWidget(page)) {
+                return;
+            }
+            dispatchYandexWidgetSuccess(page, token);
+            page.waitForTimeout(450);
+        }
     }
 
     private boolean hasOnScreenSmartCaptchaIframe(Page page) {
@@ -1250,6 +1595,8 @@ public class CaptchaService {
             return false;
         }
         revealOffScreenSmartCaptchaHosts(page);
+        revealYouDoLoginCaptchaIframe(page);
+        revealSmartCaptchaOverlay(page);
         CaptchaVendorLog.route("Yandex advanced/kaleidoscope",
                 "1) YandexSmartCaptchaTaskProxyless → smart-token"
                         + (yandexAudioEnabled ? "; 2) AudioTask" : "")
@@ -1266,7 +1613,11 @@ public class CaptchaService {
             ok = yandexAudioSolver.solve(page);
             log.info("SmartCaptcha/2Captcha advanced: AudioTask → {}", ok ? "ok" : "не снято");
             if (ok && isSmartTokenPresentOnPage(page)) {
-                dismissSmartCaptchaOverlay(page);
+                if (isYouDoPage(page)) {
+                    dismissSmartCaptchaOverlayIfWidgetAccepted(page);
+                } else {
+                    dismissSmartCaptchaOverlay(page);
+                }
             }
         }
         if (!ok && yandexPazlEnabled && shouldUsePazlCaptcha(page)) {
@@ -1278,8 +1629,9 @@ public class CaptchaService {
             recordFailure(page, CaptchaFailureCode.YOUDO_KALEIDOSCOPE_FAIL,
                     "Advanced SmartCaptcha: 2Captcha token/audio не помогли", "advanced-2captcha-fail");
         }
-        logSmartCaptchaResolutionVerdict(page, ok ? "after-advanced-2captcha-ok" : "after-advanced-2captcha-fail");
-        return ok;
+        boolean widgetOk = isYandexSmartCaptchaAcceptedByWidget(page);
+        logSmartCaptchaResolutionVerdict(page, widgetOk ? "after-advanced-2captcha-ok" : "after-advanced-2captcha-fail");
+        return widgetOk;
     }
 
     /**
@@ -1292,49 +1644,45 @@ public class CaptchaService {
             return false;
         }
         revealYouDoLoginCaptchaIframe(page);
-        CaptchaVendorLog.route("YOUDO Yandex SmartCaptcha",
-                "1) YandexSmartCaptchaTaskProxyless"
-                        + (yandexAudioEnabled ? "; 2) AudioTask" : "")
-                        + (yandexPazlEnabled ? "; опц. PazlCaptchaTask" : ""));
-        log.info("SmartCaptcha/YouDo/2Captcha: primary token (checkbox + advanced)");
+        revealSmartCaptchaOverlay(page);
+        boolean kaleidoscopeSession = kaleidoscopeSolver.hasCapturedPuzzleTask(page)
+                || isYandexKaleidoscopeChallenge(page)
+                || isYandexAdvancedUiVisible(page)
+                || isSmartCaptchaOverlayVisible(page);
+        if (kaleidoscopeSession) {
+            CaptchaVendorLog.route("YOUDO Yandex SmartCaptcha",
+                    "1) PazlCaptchaTask (network /check task, сессия браузера)"
+                            + (yandexAudioEnabled ? "; 2) AudioTask" : ""));
+            boolean pazlOk = solveYouDoBrowserSessionKaleidoscope(page);
+            int apiLen = smartCaptchaApiTokenLength(page);
+            log.info("SmartCaptcha/YouDo: после Pazl в сессии → ok={} tokenAPI={} tokenВПоле={}",
+                    pazlOk, apiLen, smartCaptchaTokenLength(page));
+            if (pazlOk) {
+                return true;
+            }
+            recordFailure(page, CaptchaFailureCode.YOUDO_KALEIDOSCOPE_FAIL,
+                    "YouDo SmartCaptcha: Pazl в сессии браузера не дал getResponse", "youdo-browser-pazl");
+            logSmartCaptchaResolutionVerdict(page, "youdo-pazl-session-fail");
+            log.info("SmartCaptcha/YouDo: Pazl не завершил сессию — YandexSmartCaptchaTask (прокси браузера)");
+            boolean advancedOk = solveYandexAdvancedViaTwoCaptcha(page);
+            log.info("SmartCaptcha/YouDo: после Pazl → advanced 2Captcha → {}", advancedOk ? "ok" : "не снято");
+            return advancedOk && isYandexSmartCaptchaAcceptedByWidget(page);
+        }
+        CaptchaVendorLog.route("YOUDO Yandex SmartCaptcha", "1) YandexSmartCaptchaTaskProxyless (checkbox)");
+        log.info("SmartCaptcha/YouDo/2Captcha: checkbox — YandexSmartCaptchaTask");
         boolean ok = solveYandexSmartCaptchaViaToken(page);
         log.info("SmartCaptcha/YouDo/2Captcha: YandexSmartCaptchaTaskProxyless → {}", ok ? "ok" : "не снято");
-        if (ok && !isSmartCaptchaPending(page)) {
-            log.info("SmartCaptcha/YouDo/2Captcha: token снял challenge, pending=false — готово");
-            logSmartCaptchaResolutionVerdict(page, "youdo-2captcha-all-token-ok");
+        if (ok && isYandexSmartCaptchaReadyForYouDoSubmit(page)) {
+            log.info("SmartCaptcha/YouDo/2Captcha: checkbox — getResponse OK, challenge нет");
+            logSmartCaptchaResolutionVerdict(page, "youdo-2captcha-checkbox-ok");
             return true;
-        }
-        boolean advanced = isYandexAdvancedChallenge(page)
-                || isYandexKaleidoscopeChallenge(page)
-                || kaleidoscopeSolver.hasCapturedPuzzleTask(page);
-        log.info("SmartCaptcha/YouDo/2Captcha: после token pending={} advanced={} kaleidoscope={} networkTask={}",
-                isSmartCaptchaPending(page),
-                isYandexAdvancedChallenge(page),
-                isYandexKaleidoscopeChallenge(page),
-                kaleidoscopeSolver.hasCapturedPuzzleTask(page));
-        if (advanced || isSmartCaptchaPending(page)) {
-            if (!ok && yandexAudioEnabled) {
-                log.info("SmartCaptcha/YouDo/2Captcha: token не снял challenge — audio");
-                ok = yandexAudioSolver.solve(page);
-                log.info("SmartCaptcha/YouDo/2Captcha: AudioTask → {}", ok ? "ok" : "не снято");
-                if (ok && isSmartTokenPresentOnPage(page)) {
-                    dismissSmartCaptchaOverlay(page);
-                }
-            }
-            if (!ok && yandexPazlEnabled && shouldUsePazlCaptcha(page)) {
-                log.info("SmartCaptcha/YouDo/2Captcha: PazlCaptchaTask");
-                ok = kaleidoscopeSolver.solve(page);
-                log.info("SmartCaptcha/YouDo/2Captcha: PazlCaptchaTask → {}", ok ? "ok" : "не снято");
-            }
-        } else {
-            log.info("SmartCaptcha/YouDo/2Captcha: доп. audio/pazl не нужны (advanced=false, pending=false)");
         }
         if (!ok) {
             recordFailure(page, CaptchaFailureCode.YOUDO_KALEIDOSCOPE_FAIL,
-                    "YouDo SmartCaptcha: 2Captcha (token/audio) не помогли", "youdo-2captcha-all");
+                    "YouDo SmartCaptcha: checkbox 2Captcha не помог", "youdo-2captcha-checkbox");
         }
-        logSmartCaptchaResolutionVerdict(page, ok ? "youdo-2captcha-all-ok" : "youdo-2captcha-all-fail");
-        return ok;
+        logSmartCaptchaResolutionVerdict(page, ok ? "youdo-2captcha-checkbox-ok" : "youdo-2captcha-checkbox-fail");
+        return ok && isYandexSmartCaptchaAcceptedByWidget(page);
     }
 
     /** Снимок SmartCaptcha на форме логина (отладка). */
@@ -1507,24 +1855,27 @@ public class CaptchaService {
             return false;
         }
 
-        applyYandexSmartCaptchaToken(page, frame, token.get());
-        dismissSmartCaptchaOverlay(page);
-        page.waitForTimeout(1500);
-        if (isYandexSmartCaptchaPassed(frame)) {
+        String tokenStr = token.get();
+        applyYandexSmartCaptchaToken(page, frame, tokenStr);
+        waitForYandexSmartCaptchaWidgetAcceptance(page, tokenStr, 6_000);
+        if (isYandexSmartCaptchaAcceptedByWidget(page)) {
+            dismissSmartCaptchaOverlayIfWidgetAccepted(page);
             logSmartCaptchaResolutionVerdict(page, "after-2captcha-token-ui-passed");
             return true;
         }
-        if (isSmartTokenPresentOnPage(page)) {
-            if (isSmartCaptchaOverlayVisible(page)) {
-                log.warn("SmartCaptcha/2Captcha: smart-token есть, но advanced-оверлей ещё виден — скрываем и продолжаем");
-                dismissSmartCaptchaOverlay(page);
-                page.waitForTimeout(500);
-            }
-            log.info("SmartCaptcha/2Captcha: чекбокс в iframe не отметился, но smart-token на странице есть — продолжаем логин");
-            logSmartCaptchaResolutionVerdict(page, "after-2captcha-token-field-only");
+        if (isYandexSmartCaptchaPassed(frame)
+                && !isYandexKaleidoscopeChallenge(page)
+                && !isYandexAdvancedUiVisible(page)) {
+            dismissSmartCaptchaOverlayIfWidgetAccepted(page);
+            logSmartCaptchaResolutionVerdict(page, "after-2captcha-token-checkbox-ui");
             return true;
         }
-        log.warn("SmartCaptcha/2Captcha: токен получен, но не подтверждён ни UI, ни полем smart-token");
+        if (isSmartTokenPresentOnPage(page)) {
+            log.warn("SmartCaptcha/2Captcha: токен только в DOM (getResponse=0), виджет не принял");
+        }
+        if (isYouDoPage(page)) {
+            ensureYouDoCaptchaChallengeVisible(page);
+        }
         logSmartCaptchaResolutionVerdict(page, "after-2captcha-token-unconfirmed");
         return false;
     }
@@ -1666,21 +2017,67 @@ public class CaptchaService {
         } catch (Exception e) {
             log.debug("SmartCaptcha/2Captcha: postMessage во frame: {}", e.getMessage());
         }
-        dismissSmartCaptchaOverlay(page);
-        if (page.url() != null && page.url().contains("youdo")) {
-            suppressYouDoLoginCaptchaClickBlockers(page);
+        if (!isYouDoPage(page)) {
+            dismissSmartCaptchaOverlay(page);
         }
         resumeYandexSmartCaptchaForForm(page);
+        dispatchYandexWidgetSuccess(page, token);
         log.info("SmartCaptcha/2Captcha: token применён на странице, len={}", token != null ? token.length() : 0);
         logSmartCaptchaResolutionVerdict(page, "after-apply-token");
     }
 
     /**
-     * Единая строка для логов: по DOM/UI видно, считается ли SmartCaptcha пройденной (сценарий решения не меняет).
+     * Сообщает React/виджету Yandex об успешной капче (колбэки render/subscribe), не только hidden input.
+     *
+     * @return число сработавших колбэков (0 — виджет мог не принять внешний токен)
+     */
+    public int dispatchYandexWidgetSuccess(Page page, String token) {
+        if (page == null || page.isClosed()) {
+            return 0;
+        }
+        try {
+            String t = token;
+            if (t == null || t.length() < 20) {
+                t = page.evaluate(
+                        """
+                                () => {
+                                  const el = document.querySelector(
+                                    'input[name="smart-token"], input[name="smart_token"]');
+                                  return el && el.value && el.value.length > 20 ? el.value : '';
+                                }
+                                """).toString();
+            }
+            if (t == null || t.length() < 20) {
+                return 0;
+            }
+            Object raw = page.evaluate(DISPATCH_YANDEX_WIDGET_SUCCESS_JS, t);
+            String json = raw != null ? raw.toString() : "{}";
+            log.info("SmartCaptcha/YouDo: dispatch widget success → {}", json);
+            if (json.contains("\"hits\":")) {
+                int idx = json.indexOf("\"hits\":");
+                int end = json.indexOf(',', idx);
+                if (end < 0) {
+                    end = json.indexOf('}', idx);
+                }
+                try {
+                    return Integer.parseInt(json.substring(idx + 7, end).trim());
+                } catch (NumberFormatException ignored) {
+                    return 0;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("SmartCaptcha: dispatch widget success: {}", e.getMessage());
+        }
+        return 0;
+    }
+
+    /**
+     * Единая строка: YouDo/виджет принял капчу ({@code getResponse()>20}, нет overlay/kaleidoscope).
+     * Не путать с «2Captcha getTaskResult=ready» — это только ответ API.
      */
     public void logSmartCaptchaResolutionVerdict(Page page, String context) {
         if (page == null || page.isClosed()) {
-            log.info("SmartCaptcha ИТОГ [{}] РЕШЕНА=НЕТ (страница закрыта)", context);
+            log.info("SmartCaptcha ИТОГ [{}] YOUDO_КАПЧА_СНЯТА=НЕТ (страница закрыта)", context);
             return;
         }
         int tokenFieldLen = smartCaptchaTokenLength(page);
@@ -1696,15 +2093,18 @@ public class CaptchaService {
             pending = isSmartCaptchaPending(page);
         } catch (Exception e) {
             log.info(
-                    "SmartCaptcha ИТОГ [{}] РЕШЕНА=НЕИЗВЕСТНО tokenВПоле={} tokenAPI={} (probe: {})",
+                    "SmartCaptcha ИТОГ [{}] YOUDO_КАПЧА_СНЯТА=НЕТ | tokenВПоле={} tokenAPI(getResponse)={} | probeError={}",
                     context, tokenFieldLen, tokenApiLen, e.getMessage());
             return;
         }
-        boolean hasToken = tokenFieldLen > 20 || tokenApiLen > 20;
-        boolean solved = hasToken && !pending;
+        boolean solved = tokenApiLen > 20
+                && !pending
+                && !kaleidoscope
+                && !advancedUi
+                && !overlay;
         String verdict = solved ? "ДА" : "НЕТ";
         log.info(
-                "SmartCaptcha ИТОГ [{}] РЕШЕНА={} | tokenВПоле={} tokenAPI={} | pending={} | overlay={} | advancedUi={} | kaleidoscope={} | url={}",
+                "SmartCaptcha ИТОГ [{}] YOUDO_КАПЧА_СНЯТА={} | tokenВПоле={} tokenAPI(getResponse)={} | pending={} | overlay={} | advancedUi={} | kaleidoscope={} | url={}",
                 context,
                 verdict,
                 tokenFieldLen,
@@ -1722,20 +2122,7 @@ public class CaptchaService {
             return 0;
         }
         try {
-            Object len = page.evaluate(
-                    """
-                            () => {
-                              if (!window.smartCaptcha || typeof window.smartCaptcha.getResponse !== 'function') {
-                                return 0;
-                              }
-                              try {
-                                const r = window.smartCaptcha.getResponse();
-                                return r && r.length > 20 ? r.length : 0;
-                              } catch (e) {
-                                return 0;
-                              }
-                            }
-                            """);
+            Object len = page.evaluate(SMART_CAPTCHA_API_RESPONSE_LEN_JS);
             if (len instanceof Number number) {
                 return number.intValue();
             }
@@ -1752,6 +2139,7 @@ public class CaptchaService {
         if (page == null || page.isClosed()) {
             return;
         }
+        dispatchYandexWidgetSuccess(page, null);
         try {
             page.evaluate(
                     """
@@ -1796,13 +2184,6 @@ public class CaptchaService {
                                 }
                               });
                               window.dispatchEvent(new CustomEvent('smart-captcha-token', { detail: token }));
-                              for (const b of document.querySelectorAll('button')) {
-                                const text = (b.textContent || '').trim();
-                                if (!text.includes('Далее')) continue;
-                                b.disabled = false;
-                                b.removeAttribute('aria-busy');
-                                b.classList.remove('disabled');
-                              }
                               return true;
                             }
                             """);

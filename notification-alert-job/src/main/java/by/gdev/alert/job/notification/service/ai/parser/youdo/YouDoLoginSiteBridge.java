@@ -50,38 +50,87 @@ public class YouDoLoginSiteBridge {
                 el.dispatchEvent(new Event('change', { bubbles: true }));
                 return true;
               };
+              const CAPTCHA_HANDLER_NAMES = [
+                'onSuccess', 'onCaptchaSuccess', 'onVerify', 'onToken', 'callback',
+                'onSmartCaptchaSuccess', 'handleCaptchaSuccess', 'setCaptchaToken', 'setSmartToken',
+                'setToken', 'onChallengeHidden', 'onChallengeSuccess', 'onCaptchaToken'
+              ];
+              const LOADING_HANDLER_NAMES = [
+                'setLoading', 'setIsLoading', 'setSubmitting', 'setIsSubmitting', 'setPending'
+              ];
+              const walkReactFiber = (dom, visitor) => {
+                if (!dom) return;
+                const fiberKey = Object.keys(dom).find((k) => k.startsWith('__reactFiber$'));
+                if (!fiberKey) return;
+                let fiber = dom[fiberKey];
+                for (let i = 0; i < 120 && fiber; i++) {
+                  visitor(fiber);
+                  fiber = fiber.return;
+                }
+              };
+              const PROP_NAME_HINT = /captcha|smart|token|verify|challenge/i;
               const invokeCaptchaReactHandlers = (dom, t) => {
                 if (!dom) return false;
-                const handlerNames = ['onSuccess', 'onCaptchaSuccess', 'onVerify', 'onToken', 'callback'];
-                let hit = false;
-                const propKey = Object.keys(dom).find((k) => k.startsWith('__reactProps$'));
-                if (propKey && dom[propKey]) {
-                  const props = dom[propKey];
-                  for (const name of handlerNames) {
-                    if (typeof props[name] === 'function') {
-                      try { props[name](t); hit = true; } catch (e) { /* ignore */ }
+                let hit = 0;
+                const tryProps = (props) => {
+                  if (!props || typeof props !== 'object') return;
+                  for (const [name, fn] of Object.entries(props)) {
+                    if (typeof fn !== 'function') continue;
+                    if (CAPTCHA_HANDLER_NAMES.includes(name) || PROP_NAME_HINT.test(name)) {
+                      try { fn(t); hit++; } catch (e) { /* ignore */ }
                     }
                   }
-                }
-                const fiberKey = Object.keys(dom).find((k) => k.startsWith('__reactFiber$'));
-                if (fiberKey) {
-                  let fiber = dom[fiberKey];
-                  for (let i = 0; i < 90 && fiber; i++) {
-                    const props = fiber.memoizedProps || fiber.pendingProps;
-                    if (props) {
-                      for (const name of handlerNames) {
-                        if (typeof props[name] === 'function') {
-                          try {
-                            props[name](t);
-                            hit = true;
-                          } catch (e) { /* ignore */ }
-                        }
+                };
+                const propKey = Object.keys(dom).find((k) => k.startsWith('__reactProps$'));
+                if (propKey && dom[propKey]) tryProps(dom[propKey]);
+                walkReactFiber(dom, (fiber) => {
+                  tryProps(fiber.memoizedProps);
+                  tryProps(fiber.pendingProps);
+                  const typeName = fiber.type && (fiber.type.name || fiber.type.displayName
+                    || (fiber.elementType && (fiber.elementType.name || fiber.elementType.displayName)));
+                  if (typeName && /SignIn|Captcha|Smart/i.test(String(typeName))) {
+                    tryProps(fiber.memoizedProps);
+                  }
+                });
+                return hit > 0;
+              };
+              const invokeLoadingReset = (dom) => {
+                if (!dom) return false;
+                let hit = false;
+                walkReactFiber(dom, (fiber) => {
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (!props) return;
+                  for (const name of LOADING_HANDLER_NAMES) {
+                    if (typeof props[name] === 'function') {
+                      try { props[name](false); hit = true; } catch (e) { /* ignore */ }
+                    }
+                  }
+                });
+                return hit;
+              };
+              const invokeFiberTokenHandlers = (t) => {
+                const login = document.querySelector('input[name="login"]');
+                if (!login) return 0;
+                let hits = 0;
+                walkReactFiber(login, (fiber) => {
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (!props) return;
+                  for (const [name, fn] of Object.entries(props)) {
+                    if (typeof fn !== 'function') continue;
+                    if (!/captcha|smart|token|verify|challenge/i.test(name)) continue;
+                    try { fn(t); hits++; } catch (e) { /* ignore */ }
+                  }
+                  const typeName = fiber.type && (fiber.type.name || fiber.type.displayName
+                    || (fiber.elementType && (fiber.elementType.name || fiber.elementType.displayName)));
+                  if (typeName && /SignIn|Email|Captcha|Login/i.test(String(typeName))) {
+                    for (const name of CAPTCHA_HANDLER_NAMES) {
+                      if (typeof props[name] === 'function') {
+                        try { props[name](t); hits++; } catch (e) { /* ignore */ }
                       }
                     }
-                    fiber = fiber.return;
                   }
-                }
-                return hit;
+                });
+                return hits;
               };
               const findOrCreateTokenInput = () => {
                 const names = ['smart-token', 'smart_token'];
@@ -120,6 +169,64 @@ public class YouDoLoginSiteBridge {
                   try { window[cb](token); reactHooks++; } catch (e) { /* ignore */ }
                 }
               });
+              const loginEl = document.querySelector('input[name="login"]');
+              if (loginEl) {
+                if (invokeCaptchaReactHandlers(loginEl, token)) reactHooks++;
+                reactHooks += invokeFiberTokenHandlers(token);
+                invokeLoadingReset(loginEl);
+              }
+              reactHooks += invokeFiberTokenHandlers(token);
+              const fiberTypeName = (fiber) => {
+                if (!fiber || !fiber.type) return '';
+                const t = fiber.type;
+                return String(t.displayName || t.name
+                  || (fiber.elementType && (fiber.elementType.displayName || fiber.elementType.name)) || '');
+              };
+              const invokeSignInCallbacks = (t) => {
+                const login = document.querySelector('input[name="login"]');
+                if (!login) return 0;
+                let hits = 0;
+                walkReactFiber(login, (fiber) => {
+                  const tn = fiberTypeName(fiber);
+                  if (!/SignIn|SmartCaptcha|Captcha|Email/i.test(tn)) return;
+                  const props = fiber.memoizedProps || fiber.pendingProps || {};
+                  for (const [name, fn] of Object.entries(props)) {
+                    if (typeof fn !== 'function') continue;
+                    if (/captcha|token|success|verify|challenge|smart|submit/i.test(name)) {
+                      try { fn(t); hits++; } catch (e) {
+                        try { fn(); hits++; } catch (e2) { /* ignore */ }
+                      }
+                    }
+                  }
+                });
+                return hits;
+              };
+              reactHooks += invokeSignInCallbacks(token);
+              if (window.smartCaptcha && typeof window.smartCaptcha.subscribe === 'function') {
+                try {
+                  const ids = window.smartCaptcha._widgetIdMap || window.smartCaptcha._widgetIds
+                    || window.smartCaptcha._widgets;
+                  if (ids && typeof ids === 'object') {
+                    for (const id of Object.values(ids)) {
+                      try {
+                        window.smartCaptcha.subscribe(id, () => {});
+                      } catch (e) { /* ignore */ }
+                    }
+                  }
+                } catch (e) { /* ignore */ }
+              }
+              const nextEl = [...document.querySelectorAll('button')]
+                .find((b) => b.offsetParent !== null && (b.textContent || '').includes('Далее'));
+              if (nextEl) {
+                if (invokeCaptchaReactHandlers(nextEl, token)) reactHooks++;
+                invokeLoadingReset(nextEl);
+              }
+              let loadingFiberResets = 0;
+              for (const b of document.querySelectorAll('button')) {
+                if (b.offsetParent === null) continue;
+                if (!(b.textContent || '').includes('Далее')) continue;
+                if (invokeLoadingReset(b)) loadingFiberResets++;
+              }
               const payloads = [
                 { event: 'smart-captcha', token },
                 { methodCall: 'success', token },
@@ -138,6 +245,20 @@ public class YouDoLoginSiteBridge {
               });
               window.dispatchEvent(new CustomEvent('smart-captcha-token', { detail: token }));
               let apiLen = 0;
+              if (window.smartCaptcha) {
+                try {
+                  if (typeof window.smartCaptcha.setResponse === 'function') {
+                    window.smartCaptcha.setResponse(token);
+                  }
+                  const ids = window.smartCaptcha._widgetIdMap || window.smartCaptcha._widgetIds
+                    || window.smartCaptcha._widgets;
+                  if (ids && typeof ids === 'object' && typeof window.smartCaptcha.setResponse === 'function') {
+                    for (const id of Object.values(ids)) {
+                      try { window.smartCaptcha.setResponse(id, token); } catch (e) { /* ignore */ }
+                    }
+                  }
+                } catch (e) { /* ignore */ }
+              }
               if (window.smartCaptcha && typeof window.smartCaptcha.getResponse === 'function') {
                 try {
                   const r = window.smartCaptcha.getResponse();
@@ -160,10 +281,163 @@ public class YouDoLoginSiteBridge {
                 tokenInScope: tokenInput ? (tokenInput.value || '').length : 0,
                 tokenApiLen: apiLen,
                 reactHooks,
+                loadingFiberResets,
                 nextFound: !!nextBtn,
                 nextDisabled: nextBtn ? nextBtn.disabled : null,
                 nextAriaBusy: nextBtn ? nextBtn.getAttribute('aria-busy') : null
               });
+            }
+            """;
+
+    private static final String CLICK_NEXT_REACT_JS = """
+            () => {
+              const btn = [...document.querySelectorAll('button')]
+                .find((b) => b.offsetParent !== null && (b.textContent || '').includes('Далее'));
+              if (!btn) return JSON.stringify({ ok: false, reason: 'no-next' });
+              const ev = {
+                preventDefault() {},
+                stopPropagation() {},
+                target: btn,
+                currentTarget: btn,
+                type: 'click',
+                bubbles: true,
+                cancelable: true,
+                nativeEvent: new MouseEvent('click', { bubbles: true, cancelable: true })
+              };
+              const propKey = Object.keys(btn).find((k) => k.startsWith('__reactProps$'));
+              let reactClick = false;
+              if (propKey && btn[propKey]) {
+                const props = btn[propKey];
+                for (const name of ['onClick', 'onPointerUp', 'onMouseUp']) {
+                  if (typeof props[name] === 'function') {
+                    try { props[name](ev); reactClick = true; } catch (e) { /* ignore */ }
+                  }
+                }
+              }
+              const fiberKey = Object.keys(btn).find((k) => k.startsWith('__reactFiber$'));
+              if (fiberKey) {
+                let fiber = btn[fiberKey];
+                for (let i = 0; i < 40 && fiber; i++) {
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (props && typeof props.onClick === 'function') {
+                    try { props.onClick(ev); reactClick = true; } catch (e) { /* ignore */ }
+                  }
+                  fiber = fiber.return;
+                }
+              }
+              return JSON.stringify({ ok: reactClick, reactClick });
+            }
+            """;
+
+    private static final String CLICK_BACK_REACT_JS = """
+            () => {
+              const btn = [...document.querySelectorAll('button')]
+                .find((b) => b.offsetParent !== null && (b.textContent || '').includes('Назад'));
+              if (!btn) return JSON.stringify({ ok: false, reason: 'no-back' });
+              const ev = {
+                preventDefault() {},
+                stopPropagation() {},
+                target: btn,
+                currentTarget: btn,
+                type: 'click',
+                bubbles: true,
+                cancelable: true,
+                nativeEvent: new MouseEvent('click', { bubbles: true, cancelable: true })
+              };
+              const propKey = Object.keys(btn).find((k) => k.startsWith('__reactProps$'));
+              let reactClick = false;
+              if (propKey && btn[propKey]) {
+                const props = btn[propKey];
+                for (const name of ['onClick', 'onPointerUp', 'onMouseUp']) {
+                  if (typeof props[name] === 'function') {
+                    try { props[name](ev); reactClick = true; } catch (e) { /* ignore */ }
+                  }
+                }
+              }
+              const fiberKey = Object.keys(btn).find((k) => k.startsWith('__reactFiber$'));
+              if (fiberKey) {
+                let fiber = btn[fiberKey];
+                for (let i = 0; i < 40 && fiber; i++) {
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (props && typeof props.onClick === 'function') {
+                    try { props.onClick(ev); reactClick = true; } catch (e) { /* ignore */ }
+                  }
+                  fiber = fiber.return;
+                }
+              }
+              if (!reactClick) {
+                try { btn.click(); reactClick = true; } catch (e) { /* ignore */ }
+              }
+              return JSON.stringify({ ok: reactClick, reactClick });
+            }
+            """;
+
+    private static final String RESET_STUCK_LOADING_JS = """
+            () => {
+              const LOADING_HANDLER_NAMES = [
+                'setLoading', 'setIsLoading', 'setSubmitting', 'setIsSubmitting', 'setPending'
+              ];
+              const fiberTypeName = (fiber) => {
+                if (!fiber || !fiber.type) return '';
+                const t = fiber.type;
+                return String(t.displayName || t.name || (fiber.elementType && (fiber.elementType.displayName || fiber.elementType.name)) || '');
+              };
+              const walkReactFiber = (dom, visitor) => {
+                if (!dom) return;
+                const fiberKey = Object.keys(dom).find((k) => k.startsWith('__reactFiber$'));
+                if (!fiberKey) return;
+                let fiber = dom[fiberKey];
+                for (let i = 0; i < 160 && fiber; i++) {
+                  visitor(fiber);
+                  fiber = fiber.return;
+                }
+              };
+              const resetHookLoadingStates = (fiber) => {
+                let hits = 0;
+                const name = fiberTypeName(fiber);
+                if (!/SignIn|Email|Login|Captcha/i.test(name)) return 0;
+                let hook = fiber.memoizedState;
+                while (hook) {
+                  if (hook.queue && typeof hook.queue.dispatch === 'function' && hook.memoizedState === true) {
+                    try { hook.queue.dispatch(false); hits++; } catch (e) { /* ignore */ }
+                  }
+                  hook = hook.next;
+                }
+                return hits;
+              };
+              const invokeLoadingReset = (dom) => {
+                if (!dom) return { propHits: 0, hookHits: 0 };
+                let propHits = 0;
+                let hookHits = 0;
+                walkReactFiber(dom, (fiber) => {
+                  hookHits += resetHookLoadingStates(fiber);
+                  const props = fiber.memoizedProps || fiber.pendingProps;
+                  if (!props) return;
+                  for (const name of LOADING_HANDLER_NAMES) {
+                    if (typeof props[name] === 'function') {
+                      try { props[name](false); propHits++; } catch (e) { /* ignore */ }
+                    }
+                  }
+                });
+                return { propHits, hookHits };
+              };
+              let propHits = 0;
+              let hookHits = 0;
+              const login = document.querySelector('input[name="login"]');
+              if (login) {
+                const r = invokeLoadingReset(login);
+                propHits += r.propHits;
+                hookHits += r.hookHits;
+              }
+              for (const b of document.querySelectorAll('button')) {
+                if (b.offsetParent === null) continue;
+                const text = (b.textContent || '').trim();
+                if (!text.includes('Далее')) continue;
+                const r = invokeLoadingReset(b);
+                propHits += r.propHits;
+                hookHits += r.hookHits;
+              }
+              return JSON.stringify({ propHits, hookHits });
             }
             """;
 
@@ -459,6 +733,98 @@ public class YouDoLoginSiteBridge {
         }
     }
 
+    /**
+     * Сбрасывает зависший спиннер «Далее» после неудачного submit до капчи (внешний smart-token уже в DOM).
+     */
+    /**
+     * Клик «Далее» через React onClick (DOM-клик иногда не доходит до обработчика после внешнего smart-token).
+     */
+    public boolean clickNextViaReact(Page page) {
+        if (page == null || page.isClosed()) {
+            return false;
+        }
+        try {
+            Object raw = page.evaluate(CLICK_NEXT_REACT_JS);
+            log.info("YOUDO site-bridge: React click «Далее» → {}", raw);
+            if (raw == null) {
+                return false;
+            }
+            String s = raw.toString();
+            return s.contains("\"reactClick\":true") || s.contains("\"ok\":true");
+        } catch (Exception e) {
+            log.warn("YOUDO site-bridge: React click «Далее» failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    public void resetStuckEmailSubmitUi(Page page) {
+        if (page == null || page.isClosed()) {
+            return;
+        }
+        try {
+            Object raw = page.evaluate(RESET_STUCK_LOADING_JS);
+            log.info("YOUDO site-bridge: reset stuck loading → {}", raw);
+        } catch (Exception e) {
+            log.debug("YOUDO site-bridge: reset stuck loading failed: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * После внешнего smart-token: сообщить React о капче, снять зависший loading, нажать «Далее» через onClick.
+     */
+    public boolean completeEmailSubmitAfterExternalToken(Page page) {
+        if (page == null || page.isClosed()) {
+            return false;
+        }
+        commitExternalSmartToken(page);
+        resetStuckEmailSubmitUi(page);
+        page.waitForTimeout(400);
+        if (waitForOtpStepInDialog(page, 800)) {
+            return true;
+        }
+        boolean reactClick = clickNextViaReact(page);
+        page.waitForTimeout(500);
+        if (waitForOtpStepInDialog(page, 2_500)) {
+            return true;
+        }
+        log.info("YOUDO site-bridge: complete email submit reactClick={} probe={}",
+                reactClick, probeLoginDialog(page));
+        return reactClick;
+    }
+
+    /**
+     * Сброс зависшего loading после клика «Далее» до капчи: «Назад» → снова email + токен + «Далее».
+     */
+    public boolean recoverStuckEmailSubmitViaBack(Page page, String expectedEmail) {
+        if (page == null || page.isClosed()) {
+            return false;
+        }
+        try {
+            log.info("YOUDO site-bridge: recover stuck submit — «Назад» + повтор «Далее»");
+            commitExternalSmartToken(page);
+            Object backRaw = page.evaluate(CLICK_BACK_REACT_JS);
+            log.info("YOUDO site-bridge: React click «Назад» → {}", backRaw);
+            page.waitForTimeout(1_200);
+            ensureLoginEmail(page, expectedEmail);
+            resetStuckEmailSubmitUi(page);
+            commitExternalSmartToken(page);
+            page.waitForTimeout(500);
+            if (waitForOtpStepInDialog(page, 2_000)) {
+                return true;
+            }
+            boolean next = clickNextViaReact(page);
+            page.waitForTimeout(700);
+            if (waitForOtpStepInDialog(page, 10_000)) {
+                return true;
+            }
+            log.info("YOUDO site-bridge: recover via back next={} probe={}", next, probeLoginDialog(page));
+            return next;
+        } catch (Exception e) {
+            log.warn("YOUDO site-bridge: recover via back failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
     public String probeLoginDialog(Page page) {
         if (page == null || page.isClosed()) {
             return "{}";
@@ -496,8 +862,10 @@ public class YouDoLoginSiteBridge {
                                   if (!nextBtn) return false;
                                   if (nextBtn.disabled || nextBtn.getAttribute('aria-busy') === 'true') return false;
                                   const cls = String(nextBtn.className || '');
+                                  const loader = nextBtn.querySelector(
+                                    '[class*="loader"], [class*="Loader"], [class*="Spinner"], [class*="spinner"]');
                                   if (cls.includes('isLoading') || cls.includes('IsLoading')) return false;
-                                  if (nextBtn.querySelector('[class*="loader"], [class*="Loader"]')) return false;
+                                  if (loader) return false;
                                   const login = document.querySelector('input[name="login"]');
                                   const lv = login ? (login.value || '') : '';
                                   if (lv.length > 40 && !lv.includes('@')) return false;
