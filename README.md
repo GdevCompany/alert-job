@@ -1,3 +1,4 @@
+Split to repositories the project and archive it.
 # alert-job
 Version for developers available by links [for Windows](README_FOR_DEVELOPERS_WNDOWS_EN.md) and [for Linux](README_FOR_DEVELOPERS_LINUX_EN.md)<br>
 Russian version you can open by [link](README_RU.md)<br>
